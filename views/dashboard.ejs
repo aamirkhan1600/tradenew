@@ -1,0 +1,191 @@
+<%- include('partials/head') %>
+<%- include('partials/nav') %>
+
+<div class="between">
+  <div>
+    <h1>Live</h1>
+    <p class="sub">Every enabled strategy, its position in the state machine, and today's result.</p>
+  </div>
+  <div class="row">
+    <button id="haltBtn" class="btn-warn">Halt trading</button>
+  </div>
+</div>
+
+<div id="notice" class="notice hidden"></div>
+
+<div class="grid">
+  <div class="card stat">
+    <h3>Engine</h3>
+    <div class="value" id="engineState">—</div>
+    <div class="hint" id="engineHint"></div>
+  </div>
+  <div class="card stat">
+    <h3>Market data</h3>
+    <div class="value" id="feedState">—</div>
+    <div class="hint" id="feedHint">Zerodha Kite</div>
+  </div>
+  <div class="card stat">
+    <h3>Execution</h3>
+    <div class="value" id="execState">—</div>
+    <div class="hint" id="execHint">Kotak Neo</div>
+  </div>
+  <div class="card stat">
+    <h3>Net today</h3>
+    <div class="value mono" id="netToday">—</div>
+    <div class="hint" id="openHint"></div>
+  </div>
+</div>
+
+<div id="strategies" class="grid-2 mt"></div>
+
+<div class="card mt">
+  <div class="between">
+    <h2>Recent activity</h2>
+    <a class="small" href="/events">Full audit trail →</a>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Strategy</th><th>Event</th><th>Transition</th><th class="num">LTP</th><th>Message</th></tr>
+      </thead>
+      <tbody id="eventRows"><tr><td colspan="6" class="empty">Nothing yet.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// The state machine, drawn as a rail so the current stage is visible at a glance.
+const STAGES = [
+  ['IDLE', 'Idle'], ['SCANNING', 'Scan'], ['STRIKE_SELECTED', 'Strike'],
+  ['HEDGE_PENDING', 'Hedge…'], ['HEDGE_OPEN', 'Hedged'], ['ARM_WAIT', 'Arm'],
+  ['OFFSET_WAIT', 'Offset'], ['SHORT_PENDING', 'Short…'], ['POSITION_OPEN', 'Open'],
+  ['EXIT_SHORT', 'Exit'], ['EXIT_HEDGE', 'Unhedge'], ['COMPLETE', 'Done'],
+];
+
+function rail(state) {
+  const at = STAGES.findIndex(s => s[0] === state);
+  return '<div class="rail">' + STAGES.map(([key, label], i) => {
+    const cls = i === at ? 'step at' : (at > -1 && i < at ? 'step done' : 'step');
+    return '<span class="' + cls + '">' + esc(label) + '</span>';
+  }).join('') + '</div>';
+}
+
+function kv(label, value) {
+  return '<tr><td class="muted">' + label + '</td><td class="num">' + value + '</td></tr>';
+}
+
+function strategyCard(s) {
+  const t = s.trade;
+  const rows = [
+    kv('Underlying', esc(s.config.underlying) + ' · ' + esc(s.config.optionType)),
+    kv('Premium range', s.config.premiumMin + ' – ' + s.config.premiumMax),
+    kv('Arm / offset', s.config.armPrice + ' / +' + s.config.offset),
+    kv('Size', s.config.lots + ' lot' + (s.config.lots > 1 ? 's' : '')),
+  ];
+  if (t) {
+    rows.push(kv('Short leg', t.sellStrike + ' ' + t.optionType
+      + (t.sellPrice != null ? ' @ ' + num(t.sellPrice) : ' <span class="muted">(not sold yet)</span>')));
+    rows.push(kv('Hedge leg', t.hedgeStrike + ' ' + t.optionType + ' @ ' + num(t.hedgePrice)));
+    rows.push(kv('Quantity', t.qty));
+    if (t.targetPrice != null) {
+      rows.push(kv('Target / stop',
+        '<span class="pos">' + num(t.targetPrice) + '</span> / <span class="neg">' + num(t.slPrice) + '</span>'
+        + (t.targetPoints != null ? ' <span class="dim tiny">(' + num(t.targetPoints) + ' pts)</span>' : '')));
+    }
+  }
+  if (s.runtime && s.runtime.armed) rows.push(kv('Low since armed', num(s.runtime.armedLow)));
+
+  const today = s.today || {};
+  const net = Number(today.netPnl || 0);
+
+  return '<div class="card">'
+    + '<div class="between">'
+    +   '<div><h2>' + esc(s.name) + '</h2>'
+    +     '<div class="row tiny" style="margin-top:4px">'
+    +       '<span class="pill ' + (s.config.mode === 'live' ? 'live' : 'paper') + '">' + esc(s.config.mode) + '</span>'
+    +       '<span class="pill ' + (s.enabled ? 'ok' : '') + '">' + (s.enabled ? 'enabled' : 'disabled') + '</span>'
+    +       (s.exposed ? '<span class="pill warn">holds the slot</span>' : '')
+    +     '</div>'
+    +   '</div>'
+    +   '<div style="text-align:right">'
+    +     '<div style="font-weight:650">' + esc(s.state) + '</div>'
+    +     '<div class="tiny ' + signClass(net) + '">' + inr(net) + ' · ' + (today.trades || 0) + ' trades</div>'
+    +   '</div>'
+    + '</div>'
+    + rail(s.state)
+    + '<table>' + rows.join('') + '</table>'
+    + '<div class="decision">' + esc(s.lastDecision || 'idle') + '</div>'
+    + (s.lastError ? '<div class="notice err small" style="margin:10px 0 0">' + esc(s.lastError) + '</div>' : '')
+    + (t ? '<button class="btn-danger btn-sm mt" data-squareoff="' + s.id + '">Square off now</button>' : '')
+    + '</div>';
+}
+
+async function refresh() {
+  const d = await api('/live');
+
+  const eng = d.engine;
+  $('engineState').textContent = eng.alive ? (eng.halted ? 'HALTED' : 'RUNNING') : 'STOPPED';
+  $('engineState').className = 'value ' + (eng.alive && !eng.halted ? 'pos' : 'neg');
+  $('engineHint').textContent = eng.alive
+    ? (eng.owner || '') + ' · heartbeat ' + (eng.heartbeatAgeSec ?? '?') + 's ago'
+    : 'start it with: npm run engine';
+
+  $('feedState').textContent = d.brokers.zerodha === 'CONNECTED' ? 'CONNECTED' : d.brokers.zerodha;
+  $('feedState').className = 'value ' + (d.brokers.zerodha === 'CONNECTED' ? 'pos' : 'neg');
+  $('execState').textContent = d.brokers.kotak === 'CONNECTED' ? 'CONNECTED' : d.brokers.kotak;
+  $('execState').className = 'value ' + (d.brokers.kotak === 'CONNECTED' ? 'pos' : 'neg');
+
+  $('netToday').textContent = inr(d.totals.netToday);
+  $('netToday').className = 'value mono ' + signClass(d.totals.netToday);
+  $('openHint').textContent = d.totals.openCount + ' open position' + (d.totals.openCount === 1 ? '' : 's');
+
+  $('haltBtn').textContent = eng.halted ? 'Resume trading' : 'Halt trading';
+  $('haltBtn').className = eng.halted ? 'btn-primary' : 'btn-warn';
+  $('haltBtn').dataset.halted = eng.halted ? '1' : '0';
+
+  $('strategies').innerHTML = d.strategies.length
+    ? d.strategies.map(strategyCard).join('')
+    : '<div class="card"><p class="muted">No strategies yet. <a href="/strategies">Create one</a>.</p></div>';
+}
+
+async function refreshEvents() {
+  const { events } = await api('/events?limit=25');
+  $('eventRows').innerHTML = events.length ? events.map(e =>
+    '<tr>'
+    + '<td class="mono tiny">' + timeOf(e.created_at) + '</td>'
+    + '<td class="tiny">#' + esc(e.strategy_id ?? '—') + '</td>'
+    + '<td><span class="pill ' + (e.level === 'ERROR' ? 'bad' : (e.level === 'WARN' ? 'warn' : '')) + '">'
+    +   esc(e.event_type) + '</span></td>'
+    + '<td class="tiny muted">' + (e.from_state ? esc(e.from_state) + ' → ' + esc(e.to_state) : '') + '</td>'
+    + '<td class="num">' + num(e.ltp) + '</td>'
+    + '<td class="small">' + esc(e.message) + '</td>'
+    + '</tr>').join('')
+    : '<tr><td colspan="6" class="empty">Nothing yet.</td></tr>';
+}
+
+$('haltBtn').addEventListener('click', async () => {
+  const halting = $('haltBtn').dataset.halted !== '1';
+  const message = halting
+    ? 'Halt trading? New entries stop immediately. Open positions keep being managed and exits still work.'
+    : 'Resume trading?';
+  if (!confirm(message)) return;
+  try {
+    await api('/halt', { method: 'POST', body: { halted: halting } });
+    await refresh();
+  } catch (err) { toast($('notice'), err.message, 'err'); }
+});
+
+$('strategies').addEventListener('click', async (ev) => {
+  const id = ev.target?.dataset?.squareoff;
+  if (!id) return;
+  if (!confirm('Square off now?\n\nThe short is bought back first, then the hedge is sold.')) return;
+  try {
+    const r = await api('/strategies/' + id + '/square-off', { method: 'POST' });
+    toast($('notice'), r.notice || 'Square-off requested.', 'warn');
+  } catch (err) { toast($('notice'), err.message, 'err'); }
+});
+
+poll(refresh, 1500);
+poll(refreshEvents, 5000);
+</script>
+<%- include('partials/foot') %>

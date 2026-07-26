@@ -1,0 +1,90 @@
+<%- include('partials/head') %>
+<%- include('partials/nav') %>
+
+<h1>Audit trail</h1>
+<p class="sub">
+  Every state transition, arm event, offset trigger, order and exit decision, with the
+  price that caused it. This is the record to read when a trade did something unexpected.
+</p>
+
+<div class="card">
+  <div class="row">
+    <div style="flex:0 0 180px">
+      <label for="fStrategy">Strategy</label>
+      <select id="fStrategy"><option value="">All</option></select>
+    </div>
+    <div style="flex:0 0 150px">
+      <label for="fLevel">Level</label>
+      <select id="fLevel">
+        <option value="">All</option>
+        <option value="INFO">Info and above</option>
+        <option value="WARN">Warnings and errors</option>
+        <option value="ERROR">Errors only</option>
+      </select>
+    </div>
+    <div style="flex:0 0 150px">
+      <label for="fLimit">Show</label>
+      <select id="fLimit">
+        <option value="200">200 rows</option>
+        <option value="500">500 rows</option>
+        <option value="1000">1000 rows</option>
+      </select>
+    </div>
+    <div style="align-self:end"><button id="refreshBtn" class="btn-sm">Refresh</button></div>
+    <div style="align-self:end" class="check">
+      <input type="checkbox" id="fAuto" checked /><label for="fAuto">Auto-refresh</label>
+    </div>
+  </div>
+</div>
+
+<div class="card mt">
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Strategy</th><th>Trade</th><th>Event</th><th>Transition</th>
+        <th class="num">LTP</th><th class="num">Spot</th><th>Message</th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const LEVEL_ORDER = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+
+async function loadStrategies() {
+  const { strategies } = await api('/strategies');
+  $('fStrategy').innerHTML = '<option value="">All</option>'
+    + strategies.map(s => '<option value="' + s.id + '">' + esc(s.name) + '</option>').join('');
+}
+
+async function load() {
+  const params = new URLSearchParams({ limit: $('fLimit').value });
+  if ($('fStrategy').value) params.set('strategyId', $('fStrategy').value);
+  const { events } = await api('/events?' + params.toString());
+
+  const min = $('fLevel').value ? LEVEL_ORDER[$('fLevel').value] : -1;
+  const rows = events.filter(e => LEVEL_ORDER[e.level] >= min);
+
+  $('rows').innerHTML = rows.length ? rows.map(e => {
+    const cls = e.level === 'ERROR' ? 'bad' : (e.level === 'WARN' ? 'warn' : '');
+    return '<tr>'
+      + '<td class="mono tiny">' + timeOf(e.created_at) + '</td>'
+      + '<td class="tiny">#' + esc(e.strategy_id ?? '—') + '</td>'
+      + '<td class="tiny">' + (e.trade_id ? '#' + e.trade_id : '') + '</td>'
+      + '<td><span class="pill ' + cls + '">' + esc(e.event_type) + '</span></td>'
+      + '<td class="tiny muted">' + (e.from_state ? esc(e.from_state) + ' → ' + esc(e.to_state) : '') + '</td>'
+      + '<td class="num">' + num(e.ltp) + '</td>'
+      + '<td class="num">' + num(e.spot, 1) + '</td>'
+      + '<td class="small">' + esc(e.message) + '</td>'
+      + '</tr>';
+  }).join('') : '<tr><td colspan="8" class="empty">No events match.</td></tr>';
+}
+
+$('refreshBtn').addEventListener('click', () => load());
+for (const id of ['fStrategy', 'fLevel', 'fLimit']) $(id).addEventListener('change', load);
+
+loadStrategies().then(load);
+poll(() => ($('fAuto').checked ? load() : Promise.resolve()), 5000);
+</script>
+<%- include('partials/foot') %>

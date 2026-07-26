@@ -1,0 +1,98 @@
+<%- include('partials/head') %>
+<%- include('partials/nav') %>
+
+<h1>Trades</h1>
+<p class="sub">Both legs of every structure, with the charges that decided the result.</p>
+
+<div class="grid">
+  <div class="card stat"><h3>Closed</h3><div class="value mono" id="kClosed">—</div></div>
+  <div class="card stat"><h3>Win rate</h3><div class="value mono" id="kWin">—</div><div class="hint" id="kWinHint"></div></div>
+  <div class="card stat"><h3>Net</h3><div class="value mono" id="kNet">—</div><div class="hint" id="kGrossHint"></div></div>
+  <div class="card stat"><h3>Charges paid</h3><div class="value mono" id="kCharges">—</div><div class="hint">4 orders per round trip</div></div>
+</div>
+
+<div class="card mt">
+  <h2>By day</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Date</th><th class="num">Trades</th><th class="num">Wins</th><th class="num">Win %</th>
+        <th class="num">Gross</th><th class="num">Charges</th><th class="num">Net</th>
+      </tr></thead>
+      <tbody id="dailyRows"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card mt">
+  <h2>All trades</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Date</th><th>Instrument</th>
+        <th>Short</th><th class="num">Sell → exit</th>
+        <th>Hedge</th><th class="num">Buy → exit</th>
+        <th class="num">Qty</th><th>Exit</th><th class="num">Net</th><th>Status</th>
+      </tr></thead>
+      <tbody id="tradeRows"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function statusPill(s) {
+  const cls = s === 'CLOSED' ? 'ok'
+    : (s === 'NEEDS_ATTENTION' ? 'bad' : (s === 'ABORTED' ? 'warn' : ''));
+  return '<span class="pill ' + cls + '">' + esc(s) + '</span>';
+}
+
+async function load() {
+  const [{ trades }, { daily }] = await Promise.all([api('/trades?limit=300'), api('/report')]);
+
+  const closed = trades.filter(t => t.status === 'CLOSED');
+  const wins = closed.filter(t => Number(t.netPnl) >= 0).length;
+  const net = closed.reduce((a, t) => a + Number(t.netPnl || 0), 0);
+  const gross = closed.reduce((a, t) => a + Number(t.grossPnl || 0), 0);
+  const charges = closed.reduce((a, t) => a + Number(t.charges || 0), 0);
+
+  $('kClosed').textContent = closed.length;
+  $('kWin').textContent = closed.length ? Math.round(wins / closed.length * 100) + '%' : '—';
+  $('kWinHint').textContent = wins + ' of ' + closed.length;
+  $('kNet').textContent = inr(net);
+  $('kNet').className = 'value mono ' + signClass(net);
+  $('kGrossHint').textContent = 'gross ' + inr(gross);
+  $('kCharges').textContent = inr(charges);
+
+  $('dailyRows').innerHTML = daily.length ? daily.map(d =>
+    '<tr>'
+    + '<td>' + dateOf(d.trade_date) + '</td>'
+    + '<td class="num">' + d.total + '</td>'
+    + '<td class="num">' + d.wins + '</td>'
+    + '<td class="num">' + d.winRate + '%</td>'
+    + '<td class="num">' + inr(d.gross) + '</td>'
+    + '<td class="num">' + inr(d.charges) + '</td>'
+    + '<td class="num ' + signClass(d.net) + '">' + inr(d.net) + '</td>'
+    + '</tr>').join('')
+    : '<tr><td colspan="7" class="empty">No closed trades yet.</td></tr>';
+
+  $('tradeRows').innerHTML = trades.length ? trades.map(t =>
+    '<tr>'
+    + '<td class="dim">' + t.id + '</td>'
+    + '<td class="small">' + dateOf(t.tradeDate) + '</td>'
+    + '<td class="small">' + esc(t.underlying) + ' <span class="pill ' + (t.mode === 'live' ? 'live' : 'paper') + '">' + esc(t.mode) + '</span></td>'
+    + '<td class="mono small">' + num(t.sellStrike, 0) + ' ' + esc(t.optionType) + '</td>'
+    + '<td class="num">' + num(t.sellPrice) + ' → ' + num(t.sellExitPrice) + '</td>'
+    + '<td class="mono small">' + num(t.hedgeStrike, 0) + '</td>'
+    + '<td class="num">' + num(t.hedgePrice) + ' → ' + num(t.hedgeExitPrice) + '</td>'
+    + '<td class="num">' + t.qty + '</td>'
+    + '<td class="small muted">' + esc(t.exitReason || '') + '</td>'
+    + '<td class="num ' + signClass(t.netPnl) + '">' + inr(t.netPnl) + '</td>'
+    + '<td>' + statusPill(t.status) + '</td>'
+    + '</tr>').join('')
+    : '<tr><td colspan="11" class="empty">No trades yet.</td></tr>';
+}
+
+load();
+poll(load, 10000);
+</script>
+<%- include('partials/foot') %>

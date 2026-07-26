@@ -1,0 +1,237 @@
+<%- include('partials/head') %>
+<%- include('partials/nav') %>
+
+<h1>Brokers</h1>
+<p class="sub">
+  Zerodha supplies the prices; Kotak Neo places every order. Both connections are
+  needed before a strategy can trade, and both are a daily step.
+</p>
+
+<div id="notice" class="notice hidden"></div>
+
+<div class="grid">
+  <div class="card stat">
+    <h3>Zerodha — market data</h3>
+    <div class="value" id="zStatus">—</div>
+    <div class="hint" id="zHint"></div>
+  </div>
+  <div class="card stat">
+    <h3>Kotak Neo — execution</h3>
+    <div class="value" id="kStatus">—</div>
+    <div class="hint" id="kHint"></div>
+  </div>
+  <div class="card stat">
+    <h3>Instruments bridged</h3>
+    <div class="value mono" id="iBridged">—</div>
+    <div class="hint" id="iHint"></div>
+  </div>
+</div>
+
+<div class="grid-2 mt">
+  <div class="card">
+    <h2>1 · Zerodha app credentials</h2>
+    <p class="small muted">
+      From <span class="mono">developers.kite.trade</span>. Stored encrypted. Leave blank to use the
+      server-wide <span class="mono">KITE_API_KEY</span> / <span class="mono">KITE_API_SECRET</span>.
+    </p>
+    <form id="credForm" class="mt" autocomplete="off">
+      <div class="field"><label for="apiKey">API key</label><input type="text" id="apiKey" /></div>
+      <div class="field"><label for="apiSecret">API secret</label><input type="password" id="apiSecret" /></div>
+      <button class="btn-primary" type="submit">Save credentials</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>2 · Zerodha daily login</h2>
+    <p class="small muted">
+      Kite access tokens expire around 06:00 IST, so this is needed once per trading day.
+      Open the login, approve, then paste the <span class="mono">request_token</span> from the
+      redirect URL. It is exchanged once and never stored.
+    </p>
+    <a id="kiteLogin" class="btn mt" target="_blank" rel="noreferrer">Open Kite login →</a>
+    <form id="kiteForm" class="mt" autocomplete="off">
+      <div class="field"><label for="requestToken">request_token</label>
+        <input type="text" id="requestToken" placeholder="from ?request_token=…" /></div>
+      <div class="row">
+        <button class="btn-primary" type="submit">Connect</button>
+        <button class="btn-sm" type="button" id="zVerify">Test connection</button>
+        <button class="btn-sm" type="button" id="zDisconnect">Disconnect</button>
+      </div>
+      <p class="tiny dim mt">
+        A <span class="mono">request_token</span> can only be exchanged once, and access tokens
+        expire around 06:00 IST. If the feed shows 403, test the connection to see Kite's own reason.
+      </p>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>3 · Kotak Neo login</h2>
+    <p class="small muted">
+      TOTP and MPIN are forwarded to Kotak once and never written anywhere — they are the
+      second factor. Only the resulting session token is kept, encrypted.
+    </p>
+    <form id="kotakForm" class="mt" autocomplete="off">
+      <div class="field"><label for="mobile">Mobile (with country code)</label>
+        <input type="text" id="mobile" placeholder="+919876543210" /></div>
+      <div class="field"><label for="ucc">UCC</label><input type="text" id="ucc" /></div>
+      <div class="field"><label for="totp">TOTP (6 digits, refreshes every 30s)</label>
+        <input type="text" id="totp" inputmode="numeric" maxlength="6" /></div>
+      <div class="field"><label for="mpin">MPIN</label><input type="password" id="mpin" /></div>
+      <div class="row">
+        <button class="btn-primary" type="submit">Connect</button>
+        <button class="btn-sm" type="button" id="kDisconnect">Disconnect</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>4 · Instrument sync</h2>
+    <p class="small muted">
+      Downloads both masters and bridges each contract on
+      <span class="mono">(underlying, expiry, strike, type)</span>. A contract present on only one
+      side is not orderable and is never selected. Run this once a day, after both logins.
+    </p>
+    <button id="syncBtn" class="btn-primary mt">Sync instruments</button>
+    <span id="syncMsg" class="small muted" style="margin-left:8px"></span>
+    <div id="bridgeBox" class="mt small"></div>
+  </div>
+</div>
+
+<script>
+async function refresh() {
+  const d = await api('/brokers');
+
+  const z = d.zerodha;
+  $('zStatus').textContent = z.configured ? z.status : 'NO API KEY';
+  $('zStatus').className = 'value ' + (z.status === 'CONNECTED' ? 'pos' : 'neg');
+  $('zHint').textContent = z.userId
+    ? z.userId + (z.userName ? ' · ' + z.userName : '')
+    : (z.hasSecret ? 'credentials saved — daily login required' : 'add an API key and secret');
+  if (z.apiKey) $('apiKey').placeholder = z.apiKey;
+  if (z.loginUrl) { $('kiteLogin').href = z.loginUrl; $('kiteLogin').classList.remove('hidden'); }
+  else $('kiteLogin').classList.add('hidden');
+
+  const k = d.kotak;
+  $('kStatus').textContent = k.apiTokenConfigured ? k.status : 'NO API TOKEN';
+  $('kStatus').className = 'value ' + (k.status === 'CONNECTED' ? 'pos' : 'neg');
+  $('kHint').textContent = k.ucc
+    ? k.ucc + (k.userName ? ' · ' + k.userName : '')
+    : (k.apiTokenConfigured ? 'not connected' : 'set NEO_API_TOKEN in .env');
+
+  const i = d.instruments;
+  $('iBridged').textContent = i.tradable.toLocaleString('en-IN');
+  $('iHint').textContent = i.rows
+    ? i.rows.toLocaleString('en-IN') + ' contracts known · last sync '
+      + (i.syncedAt ? new Date(i.syncedAt).toLocaleString('en-IN') : 'never')
+    : 'never synced';
+
+  if (z.lastError) toast($('notice'), 'Zerodha: ' + z.lastError, 'err');
+  else if (k.lastError) toast($('notice'), 'Kotak: ' + k.lastError, 'err');
+}
+
+async function loadBridge() {
+  try {
+    const d = await api('/instruments/bridge?underlying=BANKNIFTY');
+    if (!d.health) { $('bridgeBox').innerHTML = '<span class="muted">Sync to see coverage.</span>'; return; }
+    const h = d.health;
+    const bad = h.missingKotak > 0 || h.missingZerodha > 0;
+    $('bridgeBox').innerHTML =
+      '<div class="between"><span class="muted">BANKNIFTY ' + esc(h.expiry) + '</span>'
+      + '<span class="mono ' + (bad ? 'warn' : 'pos') + '">' + h.tradable + ' / ' + h.total + ' tradable</span></div>'
+      + (bad ? '<div class="tiny dim mt">' + h.missingKotak + ' missing on Kotak, '
+          + h.missingZerodha + ' missing on Zerodha — those strikes cannot be traded.</div>' : '')
+      + (d.lotSize ? '<div class="tiny dim">lot size ' + d.lotSize + '</div>' : '');
+  } catch (_) { /* nothing synced yet */ }
+}
+
+$('credForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  try {
+    await api('/brokers/zerodha/credentials', { method: 'POST', body: {
+      apiKey: $('apiKey').value.trim(), apiSecret: $('apiSecret').value.trim(),
+    } });
+    $('apiSecret').value = '';
+    toast($('notice'), 'Credentials saved.', 'ok');
+    await refresh();
+  } catch (err) { toast($('notice'), err.message, 'err'); }
+});
+
+$('kiteForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  try {
+    await api('/brokers/zerodha/connect', { method: 'POST', body: {
+      requestToken: $('requestToken').value.trim(),
+    } });
+    $('requestToken').value = '';
+    toast($('notice'), 'Zerodha connected — market data is live.', 'ok');
+    await refresh();
+  } catch (err) { toast($('notice'), err.message, 'err'); }
+});
+
+$('zVerify').addEventListener('click', async () => {
+  $('zVerify').disabled = true;
+  try {
+    const r = await api('/brokers/zerodha/verify', { method: 'POST' });
+    if (r.ok) {
+      toast($('notice'), r.message, 'ok');
+    } else {
+      // Say which of the two checks failed — the fixes are entirely different.
+      const stage = r.stage === 'data' ? 'Logged in, but market data is unavailable'
+                                       : 'The session is not valid';
+      toast($('notice'),
+        stage + (r.loggedInAs ? ' (as ' + r.loggedInAs + ')' : '') + ': ' + r.reason
+        + (r.hint ? ' — ' + r.hint : ''), 'err');
+    }
+    await refresh();
+  } catch (err) { toast($('notice'), err.message, 'err'); }
+  finally { $('zVerify').disabled = false; }
+});
+
+$('zDisconnect').addEventListener('click', async () => {
+  if (!confirm('Disconnect market data? Running strategies will pause.')) return;
+  await api('/brokers/zerodha/disconnect', { method: 'POST' });
+  await refresh();
+});
+
+$('kotakForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  try {
+    await api('/brokers/kotak/connect', { method: 'POST', body: {
+      mobile: $('mobile').value.trim(), ucc: $('ucc').value.trim(),
+      totp: $('totp').value.trim(), mpin: $('mpin').value.trim(),
+    } });
+    $('totp').value = ''; $('mpin').value = '';
+    toast($('notice'), 'Kotak connected — orders can be placed.', 'ok');
+    await refresh();
+  } catch (err) {
+    $('totp').value = ''; $('mpin').value = '';
+    toast($('notice'), err.message, 'err');
+  }
+});
+
+$('kDisconnect').addEventListener('click', async () => {
+  if (!confirm('Disconnect execution? Strategies will not be able to place or exit orders.')) return;
+  await api('/brokers/kotak/disconnect', { method: 'POST' });
+  await refresh();
+});
+
+$('syncBtn').addEventListener('click', async () => {
+  $('syncBtn').disabled = true;
+  $('syncMsg').textContent = 'Downloading both masters — this takes about a minute…';
+  try {
+    const r = await api('/instruments/sync', { method: 'POST' });
+    $('syncMsg').textContent = r.tradable.toLocaleString('en-IN') + ' contracts bridged.';
+    if (r.warning) toast($('notice'), r.warning, 'warn');
+    await refresh();
+    await loadBridge();
+  } catch (err) {
+    $('syncMsg').textContent = '';
+    toast($('notice'), err.message, 'err');
+  } finally {
+    $('syncBtn').disabled = false;
+  }
+});
+
+refresh().then(loadBridge);
+</script>
+<%- include('partials/foot') %>

@@ -1,0 +1,341 @@
+<%- include('partials/head') %>
+<%- include('partials/nav') %>
+
+<div class="between">
+  <div>
+    <h1>Strategies</h1>
+    <p class="sub">Several can be enabled at once; the engine queues them so only one holds a position at a time.</p>
+  </div>
+  <button id="newBtn" class="btn-primary">New strategy</button>
+</div>
+
+<div id="notice" class="notice hidden"></div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>Name</th><th>Instrument</th><th>Range</th><th>Arm / offset</th>
+          <th>Target / stop</th><th class="num">Lots</th><th>Hedge</th><th>Mode</th>
+          <th>State</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="editor" class="card mt hidden">
+  <div class="between">
+    <h2 id="editorTitle">New strategy</h2>
+    <button id="closeBtn" class="btn-sm">Close</button>
+  </div>
+
+  <div class="mt">
+    <h3>Start from a template</h3>
+    <div class="row" id="templates"></div>
+    <p class="tiny dim mt">Templates only fill the form. Review the numbers — especially the cost panel — before saving.</p>
+  </div>
+
+  <div id="formError" class="notice err hidden"></div>
+
+  <form id="form" class="mt" autocomplete="off">
+    <input type="hidden" id="fId" />
+    <div class="grid">
+
+      <fieldset>
+        <legend>Instrument</legend>
+        <div class="field"><label for="fName">Name</label><input type="text" id="fName" /></div>
+        <div class="field"><label for="fUnderlying">Underlying</label>
+          <select id="fUnderlying">
+            <% options.underlyings.forEach(u => { %><option><%= u %></option><% }) %>
+          </select>
+        </div>
+        <div class="field"><label for="fOptionType">Option type</label>
+          <select id="fOptionType">
+            <% options.optionTypes.forEach(o => { %><option><%= o %></option><% }) %>
+          </select>
+        </div>
+        <div class="field"><label for="fMode">Mode</label>
+          <select id="fMode">
+            <option value="paper">paper — simulated fills, no orders</option>
+            <option value="live">live — real Kotak orders</option>
+          </select>
+        </div>
+        <div class="field"><label for="fQueuePriority">Queue priority (lower goes first)</label>
+          <input type="number" id="fQueuePriority" min="1" max="99" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Premium range &amp; trigger</legend>
+        <div class="field"><label for="fPremiumMin">Minimum premium</label>
+          <input type="number" step="0.05" id="fPremiumMin" /></div>
+        <div class="field"><label for="fPremiumMax">Maximum premium</label>
+          <input type="number" step="0.05" id="fPremiumMax" /></div>
+        <div class="field"><label for="fArmPrice">Arm price (must sit inside the range)</label>
+          <input type="number" step="0.05" id="fArmPrice" /></div>
+        <div class="field"><label for="fOffset">Offset</label>
+          <input type="number" step="0.05" id="fOffset" /></div>
+        <div class="field"><label for="fOffsetFrom">Offset measured from</label>
+          <select id="fOffsetFrom">
+            <option value="ARM">arm price + offset (as specified)</option>
+            <option value="LOW">lowest price since arming + offset</option>
+          </select>
+        </div>
+        <div class="field"><label for="fArmTimeoutSec">Give up if not armed within (seconds, 0 = until last entry)</label>
+          <input type="number" id="fArmTimeoutSec" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Exit &amp; size</legend>
+        <div class="field"><label for="fTarget">Target (premium points)</label>
+          <input type="number" step="0.05" id="fTarget" /></div>
+        <div class="field"><label for="fStoploss">Stoploss (premium points)</label>
+          <input type="number" step="0.05" id="fStoploss" /></div>
+        <div class="field"><label for="fLots">Lots</label><input type="number" id="fLots" min="1" /></div>
+        <div class="field"><label for="fProduct">Product</label>
+          <select id="fProduct">
+            <% options.products.forEach(p => { %><option><%= p %></option><% }) %>
+          </select>
+        </div>
+        <div class="field"><label for="fMarketProtectionPct">Market protection %</label>
+          <input type="number" step="0.5" id="fMarketProtectionPct" /></div>
+        <div class="check field">
+          <input type="checkbox" id="fCoverCharges" />
+          <label for="fCoverCharges">Raise the target to cover charges</label>
+        </div>
+        <div class="field"><label for="fChargeBufferPct">Buffer above breakeven (%)</label>
+          <input type="number" id="fChargeBufferPct" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Hedge — bought first, sold last</legend>
+        <div class="field"><label for="fHedgeMode">Hedge selection</label>
+          <select id="fHedgeMode">
+            <option value="STRIKE">by strike distance</option>
+            <option value="PREMIUM">by premium</option>
+          </select>
+        </div>
+        <div class="field"><label for="fHedgeDistance">Strikes beyond the short</label>
+          <input type="number" id="fHedgeDistance" min="1" /></div>
+        <div class="field"><label for="fHedgePremium">Target hedge premium (₹)</label>
+          <input type="number" step="0.05" id="fHedgePremium" /></div>
+        <div class="field"><label for="fHedgeMaxPremium">Never pay more than (blank = no cap)</label>
+          <input type="number" step="0.05" id="fHedgeMaxPremium" /></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Session (IST)</legend>
+        <div class="field"><label for="fEntryTime">First entry</label><input type="text" id="fEntryTime" placeholder="09:20" /></div>
+        <div class="field"><label for="fLastEntryTime">Last entry</label><input type="text" id="fLastEntryTime" placeholder="14:30" /></div>
+        <div class="field"><label for="fSquareOffTime">Square off</label><input type="text" id="fSquareOffTime" placeholder="15:20" /></div>
+        <div class="field"><label for="fScanStrikes">Strikes scanned either side of spot</label><input type="number" id="fScanStrikes" /></div>
+        <div class="field"><label for="fMaxQuoteAgeMs">Refuse to act on quotes older than (ms)</label><input type="number" id="fMaxQuoteAgeMs" /></div>
+        <div class="field"><label for="fHolidays">Exchange holidays (YYYY-MM-DD, comma separated)</label>
+          <textarea id="fHolidays" rows="2"></textarea></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Risk</legend>
+        <div class="field"><label for="fMaxTradesPerDay">Max trades per day</label><input type="number" id="fMaxTradesPerDay" /></div>
+        <div class="field"><label for="fDailyMaxLoss">Daily loss limit ₹ (blank = off)</label><input type="number" id="fDailyMaxLoss" /></div>
+        <div class="field"><label for="fDailyMaxProfit">Daily profit target ₹ (blank = off)</label><input type="number" id="fDailyMaxProfit" /></div>
+        <div class="field"><label for="fReentryCooldownSec">Re-entry cooldown (seconds)</label><input type="number" id="fReentryCooldownSec" /></div>
+        <div class="check field"><input type="checkbox" id="fReentryAfterTarget" /><label for="fReentryAfterTarget">Re-enter after a target</label></div>
+        <div class="check field"><input type="checkbox" id="fReentryAfterStop" /><label for="fReentryAfterStop">Re-enter after a stoploss</label></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>What this costs</legend>
+        <div id="economics" class="small muted">Fill in the size to price the round trip.</div>
+      </fieldset>
+    </div>
+
+    <div class="row mt">
+      <button type="submit" class="btn-primary">Save strategy</button>
+      <span id="saveMsg" class="small muted"></span>
+    </div>
+  </form>
+</div>
+
+<script>
+const DEFAULTS = <%- JSON.stringify(defaults) %>;
+
+const NUM = ['premiumMin','premiumMax','armPrice','offset','target','stoploss','lots','hedgeDistance',
+  'hedgePremium','hedgeMaxPremium','maxTradesPerDay','dailyMaxLoss','dailyMaxProfit','reentryCooldownSec',
+  'armTimeoutSec','scanStrikes','maxQuoteAgeMs','marketProtectionPct','chargeBufferPct','queuePriority'];
+const STR = ['name','underlying','optionType','hedgeMode','offsetFrom','entryTime','lastEntryTime',
+  'squareOffTime','mode','product'];
+const BOOL = ['coverCharges','reentryAfterTarget','reentryAfterStop'];
+const fid = (k) => 'f' + k[0].toUpperCase() + k.slice(1);
+
+// Every target here clears its own round-trip cost at the stated size. The
+// panel re-prices as you type, because the breakeven moves with the lot count.
+const TEMPLATES = [
+  { label: '₹20–30 BANKNIFTY', cfg: { name: 'BNF 20–30', underlying: 'BANKNIFTY', premiumMin: 20,
+      premiumMax: 30, armPrice: 25, offset: 0.5, target: 5, stoploss: 12, lots: 2,
+      hedgeMode: 'PREMIUM', hedgePremium: 6 } },
+  { label: '₹30–40 BANKNIFTY', cfg: { name: 'BNF 30–40', underlying: 'BANKNIFTY', premiumMin: 30,
+      premiumMax: 40, armPrice: 35, offset: 0.5, target: 5, stoploss: 12, lots: 2,
+      hedgeMode: 'PREMIUM', hedgePremium: 8 } },
+  { label: '₹35–45 BANKNIFTY', cfg: { name: 'BNF 35–45', underlying: 'BANKNIFTY', premiumMin: 35,
+      premiumMax: 45, armPrice: 40, offset: 0.5, target: 5, stoploss: 12, lots: 2,
+      hedgeMode: 'STRIKE', hedgeDistance: 10 } },
+  { label: '₹40–50 NIFTY', cfg: { name: 'NIFTY 40–50', underlying: 'NIFTY', premiumMin: 40,
+      premiumMax: 50, armPrice: 45, offset: 0.5, target: 5, stoploss: 12, lots: 2,
+      hedgeMode: 'PREMIUM', hedgePremium: 10 } },
+];
+
+let cache = [];
+
+function readForm() {
+  const body = {};
+  for (const k of NUM) {
+    const el = $(fid(k));
+    if (!el) continue;
+    body[k] = el.value === '' ? null : Number(el.value);
+  }
+  for (const k of STR) { const el = $(fid(k)); if (el) body[k] = el.value; }
+  for (const k of BOOL) { const el = $(fid(k)); if (el) body[k] = el.checked; }
+  body.holidays = $('fHolidays').value;
+  return body;
+}
+
+function fillForm(cfg, row) {
+  for (const k of NUM) { const el = $(fid(k)); if (el) el.value = cfg[k] == null ? '' : cfg[k]; }
+  for (const k of STR) { const el = $(fid(k)); if (el && cfg[k] != null) el.value = cfg[k]; }
+  for (const k of BOOL) { const el = $(fid(k)); if (el) el.checked = !!cfg[k]; }
+  $('fHolidays').value = (cfg.holidays || []).join(', ');
+  $('fName').value = row ? row.name : (cfg.name || 'Premium selling');
+  $('fQueuePriority').value = row ? row.queuePriority : 5;
+  $('fId').value = row ? row.id : '';
+  $('editorTitle').textContent = row ? 'Edit — ' + row.name : 'New strategy';
+  priceIt();
+}
+
+// The cost panel. This is the difference between a target that wins and a
+// target that only looks like it wins.
+let priceTimer = null;
+async function priceIt() {
+  clearTimeout(priceTimer);
+  priceTimer = setTimeout(async () => {
+    const q = new URLSearchParams();
+    for (const k of ['underlying','lots','target','stoploss','armPrice','premiumMax','hedgeMode',
+                     'hedgePremium','chargeBufferPct']) {
+      const el = $(fid(k));
+      if (el && el.value !== '') q.set(k, el.value);
+    }
+    q.set('coverCharges', $('fCoverCharges').checked ? 'true' : 'false');
+    try {
+      const d = await api('/strategies/economics?' + q.toString());
+      if (!d.available) { $('economics').innerHTML = '<span class="muted">' + esc(d.reason) + '</span>'; return; }
+      const line = (label, value, cls) =>
+        '<div class="between" style="margin:3px 0"><span class="muted">' + label
+        + '</span><span class="mono ' + (cls || '') + '">' + value + '</span></div>';
+      $('economics').innerHTML =
+          line('Quantity', d.qty + ' (' + d.lotSize + ' × ' + $('fLots').value + ')')
+        + line('Round-trip charges', inr(d.charges))
+        + line('Breakeven move', num(d.breakevenPoints) + ' pts')
+        + line('Target used', num(d.effectiveTarget) + ' pts'
+            + (d.lifted ? ' <span class="pill warn">lifted</span>' : ''))
+        + '<hr style="border:0;border-top:1px solid var(--line);margin:8px 0" />'
+        + line('Net on a win', inr(d.netAtTarget), signClass(d.netAtTarget))
+        + line('Net on a stop', inr(d.netAtStop), 'neg')
+        + (d.covers ? '' :
+            '<div class="notice err small" style="margin-top:8px">This target does not clear the '
+            + 'charges — a winning trade would still lose money.</div>');
+    } catch (_) { /* transient */ }
+  }, 300);
+}
+
+for (const k of ['underlying','lots','target','stoploss','armPrice','premiumMax','hedgeMode',
+                 'hedgePremium','chargeBufferPct','coverCharges']) {
+  const el = $(fid(k));
+  if (el) { el.addEventListener('input', priceIt); el.addEventListener('change', priceIt); }
+}
+
+function renderTemplates() {
+  $('templates').innerHTML = TEMPLATES.map((t, i) =>
+    '<button type="button" class="btn-sm" data-tpl="' + i + '">' + esc(t.label) + '</button>').join('');
+}
+
+$('templates').addEventListener('click', (ev) => {
+  const i = ev.target?.dataset?.tpl;
+  if (i == null) return;
+  fillForm({ ...DEFAULTS, ...TEMPLATES[i].cfg, mode: 'paper' }, null);
+});
+
+async function load() {
+  const d = await api('/strategies');
+  cache = d.strategies;
+  $('rows').innerHTML = cache.length ? cache.map(s => {
+    const c = s.config;
+    return '<tr>'
+      + '<td class="dim">' + s.id + '</td>'
+      + '<td>' + esc(s.name) + '</td>'
+      + '<td class="small">' + esc(c.underlying) + ' <span class="dim">' + esc(c.optionType) + '</span></td>'
+      + '<td class="mono small">' + c.premiumMin + '–' + c.premiumMax + '</td>'
+      + '<td class="mono small">' + c.armPrice + ' / +' + c.offset + '</td>'
+      + '<td class="mono small"><span class="pos">' + c.target + '</span> / <span class="neg">' + c.stoploss + '</span>'
+      +   (c.coverCharges ? ' <span class="pill" title="target is raised at entry to clear charges">auto</span>' : '') + '</td>'
+      + '<td class="num">' + c.lots + '</td>'
+      + '<td class="small">' + (c.hedgeMode === 'STRIKE' ? c.hedgeDistance + ' strikes' : '₹' + c.hedgePremium) + '</td>'
+      + '<td><span class="pill ' + (c.mode === 'live' ? 'live' : 'paper') + '">' + esc(c.mode) + '</span></td>'
+      + '<td class="small">' + esc(s.state) + '</td>'
+      + '<td style="text-align:right;white-space:nowrap">'
+      +   '<button class="btn-sm" data-edit="' + s.id + '">Edit</button> '
+      +   '<button class="btn-sm ' + (s.enabled ? 'btn-warn' : 'btn-primary') + '" data-toggle="' + s.id + '">'
+      +     (s.enabled ? 'Disable' : 'Enable') + '</button> '
+      +   '<button class="btn-sm" data-del="' + s.id + '">Delete</button>'
+      + '</td></tr>';
+  }).join('') : '<tr><td colspan="11" class="empty">No strategies yet.</td></tr>';
+}
+
+$('rows').addEventListener('click', async (ev) => {
+  const t = ev.target;
+  try {
+    if (t.dataset.edit) {
+      const row = cache.find(s => String(s.id) === t.dataset.edit);
+      if (row) { fillForm(row.config, row); $('editor').classList.remove('hidden'); $('editor').scrollIntoView({ behavior: 'smooth' }); }
+    } else if (t.dataset.toggle) {
+      const r = await api('/strategies/' + t.dataset.toggle + '/toggle', { method: 'POST' });
+      if (r.notice) toast($('notice'), r.notice, 'warn');
+      await load();
+    } else if (t.dataset.del) {
+      if (!confirm('Delete this strategy?')) return;
+      await api('/strategies/' + t.dataset.del, { method: 'DELETE' });
+      await load();
+    }
+  } catch (err) { toast($('notice'), err.message, 'err'); }
+});
+
+$('newBtn').addEventListener('click', () => {
+  fillForm(DEFAULTS, null);
+  $('editor').classList.remove('hidden');
+  $('editor').scrollIntoView({ behavior: 'smooth' });
+});
+$('closeBtn').addEventListener('click', () => $('editor').classList.add('hidden'));
+
+$('form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('formError').classList.add('hidden');
+  $('saveMsg').textContent = 'Saving…';
+  const id = $('fId').value;
+  try {
+    await api('/strategies' + (id ? '/' + id : ''), { method: id ? 'PUT' : 'POST', body: readForm() });
+    $('saveMsg').textContent = '';
+    $('editor').classList.add('hidden');
+    toast($('notice'), id ? 'Strategy updated.' : 'Strategy created.', 'ok');
+    await load();
+  } catch (err) {
+    $('saveMsg').textContent = '';
+    $('formError').textContent = err.message;
+    $('formError').classList.remove('hidden');
+  }
+});
+
+renderTemplates();
+load().catch(err => toast($('notice'), err.message, 'err'));
+</script>
+<%- include('partials/foot') %>

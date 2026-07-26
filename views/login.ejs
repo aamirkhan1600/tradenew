@@ -1,0 +1,53 @@
+<%- include('partials/head') %>
+<div class="auth-wrap">
+  <div class="auth-card">
+    <h1>Premium Range Trader</h1>
+    <p class="sub small">Zerodha for market data · Kotak Neo for execution</p>
+
+    <div class="card">
+      <% if (error) { %>
+        <div class="notice err"><%= error %></div>
+      <% } %>
+
+      <% if (isFirstRun) { %>
+        <div class="notice warn">
+          No account exists yet. The first account you create becomes the owner,
+          and registration closes afterwards.
+        </div>
+        <form method="post" action="/register" autocomplete="off">
+          <div class="field">
+            <label for="fullName">Name</label>
+            <input type="text" id="fullName" name="fullName" />
+          </div>
+          <div class="field">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" required />
+          </div>
+          <div class="field">
+            <label for="password">Password (10 characters or more)</label>
+            <input type="password" id="password" name="password" minlength="10" required />
+          </div>
+          <button class="btn-primary" type="submit" style="width:100%;justify-content:center">
+            Create owner account
+          </button>
+        </form>
+      <% } else { %>
+        <form method="post" action="/login" autocomplete="off">
+          <div class="field">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" required autofocus />
+          </div>
+          <div class="field">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required />
+          </div>
+          <button class="btn-primary" type="submit" style="width:100%;justify-content:center">
+            Sign in
+          </button>
+        </form>
+      <% } %>
+    </div>
+  </div>
+</div>
+</body>
+</html>

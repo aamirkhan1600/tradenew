@@ -1,0 +1,7 @@
+<%- include('partials/head') %>
+<% if (user) { %><%- include('partials/nav') %><% } else { %><main><% } %>
+  <h1><%= status %></h1>
+  <p class="sub"><%= message %></p>
+  <% if (detail) { %><pre class="card small mono" style="overflow:auto"><%= detail %></pre><% } %>
+  <a class="btn" href="/">Back to the dashboard</a>
+<%- include('partials/foot') %>

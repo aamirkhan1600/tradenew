@@ -1,0 +1,12 @@
+<nav>
+  <a class="brand" href="/">Premium<span>Range</span></a>
+  <a class="link <%= title === 'Live' ? 'active' : '' %>" href="/">Live</a>
+  <a class="link <%= title === 'Strategies' ? 'active' : '' %>" href="/strategies">Strategies</a>
+  <a class="link <%= title === 'Trades' ? 'active' : '' %>" href="/trades">Trades</a>
+  <a class="link <%= title === 'Audit trail' ? 'active' : '' %>" href="/events">Audit</a>
+  <a class="link <%= title === 'Brokers' ? 'active' : '' %>" href="/brokers">Brokers</a>
+  <div class="spacer"></div>
+  <span class="small muted" style="margin-right:10px"><%= user ? user.email : '' %></span>
+  <a class="btn btn-sm" href="/logout">Sign out</a>
+</nav>
+<main>
