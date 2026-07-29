@@ -1,0 +1,102 @@
+<%- include('partials/head', { title: 'zoption — broker' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <section class="card">
+    <h2>Kotak Neo <small>market data and execution</small></h2>
+    <dl class="kv">
+      <dt>Status</dt><dd class="<%= status.connected ? 'up' : 'down' %>"><%= status.status %></dd>
+      <dt>UCC</dt><dd><%= status.ucc || '—' %></dd>
+      <dt>Account</dt><dd><%= status.userName || '—' %></dd>
+      <dt>Last login</dt><dd><%= account && account.last_login_at ? new Date(account.last_login_at).toLocaleString() : '—' %></dd>
+      <% if (status.lastError) { %><dt>Last error</dt><dd class="down"><%= status.lastError %></dd><% } %>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Sign in <small>two steps — the MPIN and TOTP are forwarded once and never stored</small></h2>
+
+    <form id="step1" class="grid">
+      <label>Mobile<input name="mobile" placeholder="+919000000000" value="<%= account && account.mobile || '' %>"></label>
+      <label>UCC<input name="ucc" value="<%= account && account.ucc || '' %>"></label>
+      <label>TOTP<input name="totp" inputmode="numeric" autocomplete="one-time-code" placeholder="6 digits"></label>
+      <div class="actions"><button type="submit" class="go">Continue</button></div>
+    </form>
+
+    <form id="step2" class="grid hidden">
+      <label>MPIN<input name="mpin" type="password" inputmode="numeric" autocomplete="off"></label>
+      <div class="actions"><button type="submit" class="go">Sign in</button></div>
+    </form>
+
+    <p id="msg" class="msg"></p>
+  </section>
+
+  <section class="card">
+    <h2>Instrument master <small>synced once a session — a stale row points at a contract that no longer exists</small></h2>
+    <p>Contracts stored: <b id="instrcount">—</b></p>
+    <button id="sync" class="warn">Sync now</button>
+    <span id="syncmsg" class="msg"></span>
+  </section>
+
+</main>
+
+<script>
+const msg = document.getElementById('msg');
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const out = await res.json();
+  if (!out.ok) throw new Error(out.error || 'rejected');
+  return out;
+}
+
+document.getElementById('step1').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  msg.textContent = 'Contacting Kotak…'; msg.className = 'msg';
+  try {
+    const data = Object.fromEntries(new FormData(e.target).entries());
+    const out = await post('/api/broker/login', data);
+    msg.textContent = 'TOTP accepted' + (out.greetingName ? ' — hello ' + out.greetingName : '') + '. Now the MPIN.';
+    msg.className = 'msg ok';
+    document.getElementById('step1').classList.add('hidden');
+    document.getElementById('step2').classList.remove('hidden');
+    document.querySelector('#step2 input').focus();
+  } catch (err) { msg.textContent = err.message; msg.className = 'msg bad'; }
+});
+
+document.getElementById('step2').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  msg.textContent = 'Validating…'; msg.className = 'msg';
+  try {
+    const data = Object.fromEntries(new FormData(e.target).entries());
+    await post('/api/broker/validate', data);
+    msg.textContent = 'Signed in. The engine will pick the session up within a few seconds.';
+    msg.className = 'msg ok';
+    setTimeout(function () { location.reload(); }, 1200);
+  } catch (err) { msg.textContent = err.message; msg.className = 'msg bad'; }
+});
+
+document.getElementById('sync').addEventListener('click', async function () {
+  const out = document.getElementById('syncmsg');
+  out.textContent = 'Downloading the master — this takes a moment…'; out.className = 'msg';
+  try {
+    const r = await post('/api/broker/sync-instruments', {});
+    out.textContent = r.options + ' option contracts, ' + r.indices + ' index rows, ' + r.pruned + ' pruned.';
+    out.className = 'msg ok';
+    refresh();
+  } catch (err) { out.textContent = err.message; out.className = 'msg bad'; }
+});
+
+async function refresh() {
+  try {
+    const r = await (await fetch('/api/broker/status')).json();
+    document.getElementById('instrcount').textContent = r.instruments;
+  } catch (_) { /* the page still works without it */ }
+}
+refresh();
+</script>
+
+<%- include('partials/foot') %>

@@ -1,0 +1,252 @@
+<%- include('partials/head', { title: 'zoption — settings' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <% if (warnings && warnings.length) { %>
+    <section class="card warnbox">
+      <h2>Worth a look</h2>
+      <ul><% warnings.forEach(function (w) { %><li><%= w %></li><% }); %></ul>
+    </section>
+  <% } %>
+
+  <form class="card" id="form">
+    <h2>Strategy <small>saved between cycles only — the engine snapshots settings when a strike locks</small></h2>
+
+    <div class="grid">
+      <label>Symbol
+        <input name="symbol" value="<%= settings.symbol %>" readonly>
+      </label>
+      <label>Expiry mode
+        <select name="expiryMode">
+          <% ['CURRENT_WEEKLY','NEXT_WEEKLY','MONTHLY','MANUAL'].forEach(function (m) { %>
+            <option value="<%= m %>" <%= settings.expiryMode === m ? 'selected' : '' %>><%= m %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Trade mode
+        <select name="tradeMode">
+          <% ['BOTH','CE','PE'].forEach(function (m) { %>
+            <option value="<%= m %>" <%= settings.tradeMode === m ? 'selected' : '' %>><%= m %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Strike mode
+        <select name="strikeMode">
+          <% ['PREMIUM','ATM','ATM_OFFSET'].forEach(function (m) { %>
+            <option value="<%= m %>" <%= settings.strikeMode === m ? 'selected' : '' %>><%= m %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>ATM offset (steps)
+        <input name="atmOffset" type="number" step="1" value="<%= settings.atmOffset %>">
+      </label>
+      <label>Target premium ₹
+        <input name="targetPremium" type="number" step="0.05" value="<%= settings.targetPremium %>">
+      </label>
+      <label>Premium tolerance ₹
+        <input name="premiumTolerance" type="number" step="0.05" value="<%= settings.premiumTolerance %>">
+      </label>
+    </div>
+
+    <h2>Entry <small>the sell price is always a closed candle's close plus the offset</small></h2>
+    <div class="grid">
+      <label>Candle timeframe
+        <select name="candleTimeframe">
+          <% ['15s','30s','1m','3m','5m'].forEach(function (t) { %>
+            <option value="<%= t %>" <%= settings.candleTimeframe === t ? 'selected' : '' %>><%= t %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Sell offset ₹
+        <input name="sellOffset" type="number" step="0.05" value="<%= settings.sellOffset %>">
+      </label>
+      <label>Pending timeout (s)
+        <input name="pendingTimeout" type="number" step="1" value="<%= settings.pendingTimeout %>">
+      </label>
+      <label>Stand down after (s) <span class="hint">a leg that never gets permission; 0 = never</span>
+        <input name="legEntryTimeout" type="number" step="10" min="0" value="<%= settings.legEntryTimeout %>">
+      </label>
+      <label>Lots
+        <input name="lots" type="number" step="1" min="1" value="<%= settings.lots %>">
+      </label>
+    </div>
+
+    <h2>NIFTY trend filter
+      <small>index candles decide <em>whether</em> a side may sell — never the price</small>
+    </h2>
+    <div class="grid">
+      <label>Filter
+        <select name="trendFilter">
+          <option value="false" <%= settings.trendFilter ? '' : 'selected' %>>OFF — every candle close may enter</option>
+          <option value="true"  <%= settings.trendFilter ? 'selected' : '' %>>ON — a bullish index sells PE only, a bearish index sells CE only</option>
+        </select>
+      </label>
+      <label>Index timeframe
+        <select name="trendTimeframe">
+          <% ['5s','15s','30s','1m','3m','5m'].forEach(function (t) { %>
+            <option value="<%= t %>" <%= settings.trendTimeframe === t ? 'selected' : '' %>><%= t %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Consecutive bars that must agree
+        <input name="trendConfirmBars" type="number" step="1" min="1" max="10" value="<%= settings.trendConfirmBars %>">
+      </label>
+      <label>Minimum ticks per bar <span class="hint">fewer = the bar measured nothing</span>
+        <input name="trendMinTicks" type="number" step="1" min="0" value="<%= settings.trendMinTicks %>">
+      </label>
+      <label>Minimum body <span class="hint">% of the bar's range</span>
+        <input name="trendBodyPct" type="number" step="5" min="0" max="100" value="<%= settings.trendBodyPct %>">
+      </label>
+      <label>Close within <span class="hint">% of the high (or low)</span>
+        <input name="trendCloseNearPct" type="number" step="5" min="0" max="100" value="<%= settings.trendCloseNearPct %>">
+      </label>
+      <label>Skip above range <span class="hint">NIFTY points, across all the bars</span>
+        <input name="trendMaxRangePoints" type="number" step="1" min="1" value="<%= settings.trendMaxRangePoints %>">
+      </label>
+      <label>Momentum rule
+        <select name="trendMomentum">
+          <option value="true"  <%= settings.trendMomentum ? 'selected' : '' %>>ON — skip when the bars' ranges keep shrinking</option>
+          <option value="false" <%= settings.trendMomentum ? '' : 'selected' %>>OFF — direction and strength only</option>
+        </select>
+      </label>
+      <label>Strong body <span class="hint">% of range, scores +2</span>
+        <input name="trendStrongBodyPct" type="number" step="5" min="0" max="100" value="<%= settings.trendStrongBodyPct %>">
+      </label>
+      <label>Wick / extreme tolerance <span class="hint">% of range, scores +1 and +2</span>
+        <input name="trendWickPct" type="number" step="5" min="0" max="100" value="<%= settings.trendWickPct %>">
+      </label>
+      <label>Minimum strength <span class="hint">out of 5, every bar; 0 = direction only</span>
+        <input name="trendMinScore" type="number" step="1" min="0" max="5" value="<%= settings.trendMinScore %>">
+      </label>
+    </div>
+
+    <h2>Exit <small>tick-driven, unlike the entry</small></h2>
+    <div class="grid">
+      <label>Target ₹
+        <input name="target" type="number" step="0.05" value="<%= settings.target %>">
+      </label>
+      <label>Stop loss ₹
+        <input name="stopLoss" type="number" step="0.05" value="<%= settings.stopLoss %>">
+      </label>
+      <label>Position timeout (s)
+        <input name="positionTimeout" type="number" step="1" value="<%= settings.positionTimeout %>">
+      </label>
+    </div>
+
+    <h2>Dynamic target &amp; trailing stop
+      <small>let a winner run while the index keeps confirming — needs the trend filter on</small>
+    </h2>
+    <div class="grid">
+      <label>Dynamic target
+        <select name="dynamicTarget">
+          <option value="false" <%= settings.dynamicTarget ? '' : 'selected' %>>OFF — fixed target, taken at 1 step</option>
+          <option value="true"  <%= settings.dynamicTarget ? 'selected' : '' %>>ON — extend the target on every confirmation</option>
+        </select>
+      </label>
+      <label>Step per confirmation ₹
+        <input name="dynamicTargetStep" type="number" step="0.05" value="<%= settings.dynamicTargetStep %>">
+      </label>
+      <label>Confirmations before trail-only
+        <input name="dynamicTargetMax" type="number" step="1" min="1" max="20" value="<%= settings.dynamicTargetMax %>">
+      </label>
+      <label>Trail starts after ₹ <span class="hint">of profit; 0 = from the first tick</span>
+        <input name="trailStart" type="number" step="0.05" min="0" value="<%= settings.trailStart %>">
+      </label>
+      <label>Trail gap ₹ <span class="hint">stop sits this far above the best premium; 0 = no trail</span>
+        <input name="trailGap" type="number" step="0.05" min="0" value="<%= settings.trailGap %>">
+      </label>
+      <label>Exit on reversal
+        <select name="exitOnReversal">
+          <option value="true"  <%= settings.exitOnReversal ? 'selected' : '' %>>ON — leave when the index trend turns</option>
+          <option value="false" <%= settings.exitOnReversal ? '' : 'selected' %>>OFF — target, stop and timeout only</option>
+        </select>
+      </label>
+    </div>
+
+    <h2>Session</h2>
+    <div class="grid">
+      <label>Start (IST)<input name="sessionStart" value="<%= settings.sessionStart %>"></label>
+      <label>End (IST)<input name="sessionEnd" value="<%= settings.sessionEnd %>"></label>
+      <label>Square off (IST)<input name="squareOffAt" value="<%= settings.squareOffAt %>"></label>
+    </div>
+
+    <h2>Risk</h2>
+    <div class="grid">
+      <label>Max daily loss ₹
+        <input name="maxDailyLoss" type="number" step="100" value="<%= settings.maxDailyLoss %>">
+      </label>
+      <label>Max daily profit ₹
+        <input name="maxDailyProfit" type="number" step="100" value="<%= settings.maxDailyProfit %>">
+      </label>
+      <label>Max consecutive losses
+        <input name="maxConsecutiveLoss" type="number" step="1" value="<%= settings.maxConsecutiveLoss %>">
+      </label>
+      <label>Cooldown after a stop (s)
+        <input name="cooldownAfterSL" type="number" step="10" value="<%= settings.cooldownAfterSL %>">
+      </label>
+      <label>Market-move pause (points)
+        <input name="marketMovePause" type="number" step="5" value="<%= settings.marketMovePause %>">
+      </label>
+      <label>…within (s)
+        <input name="marketMoveWindow" type="number" step="5" value="<%= settings.marketMoveWindow %>">
+      </label>
+      <label>Max cycles per day <span class="hint">0 = unlimited</span>
+        <input name="maxCyclesPerDay" type="number" step="1" value="<%= settings.maxCyclesPerDay %>">
+      </label>
+    </div>
+
+    <h2>Mode</h2>
+    <div class="grid">
+      <label>Execution
+        <select name="mode">
+          <option value="PAPER" <%= settings.mode === 'PAPER' ? 'selected' : '' %>>PAPER — simulated against the live tick stream</option>
+          <option value="LIVE"  <%= settings.mode === 'LIVE'  ? 'selected' : '' %>>LIVE — orders reach the exchange</option>
+        </select>
+      </label>
+      <label>Cycle scope
+        <select name="cycleScope">
+          <option value="BOTH_LEGS" <%= settings.cycleScope === 'BOTH_LEGS' ? 'selected' : '' %>>BOTH_LEGS — unlock when CE and PE are both flat</option>
+          <option value="PER_LEG"   <%= settings.cycleScope === 'PER_LEG'   ? 'selected' : '' %>>PER_LEG — each leg re-enters on its own locked strike</option>
+        </select>
+      </label>
+      <label>Re-use a strike for (s) <span class="hint">PER_LEG only; 0 = forever</span>
+        <input name="cycleMaxAge" type="number" step="30" min="0" value="<%= settings.cycleMaxAge %>">
+      </label>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="go">Save</button>
+      <span id="msg" class="msg"></span>
+    </div>
+  </form>
+
+</main>
+
+<script>
+document.getElementById('form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  const data = Object.fromEntries(new FormData(e.target).entries());
+  const msg = document.getElementById('msg');
+  msg.textContent = 'Saving…';
+  msg.className = 'msg';
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const out = await res.json();
+    if (!out.ok) throw new Error(out.error || 'rejected');
+    msg.textContent = out.warnings && out.warnings.length
+      ? 'Saved with ' + out.warnings.length + ' warning(s) — reload to read them.'
+      : 'Saved.';
+    msg.className = 'msg ok';
+  } catch (err) {
+    msg.textContent = err.message;
+    msg.className = 'msg bad';
+  }
+});
+</script>
+
+<%- include('partials/foot') %>

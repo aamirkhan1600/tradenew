@@ -1,0 +1,36 @@
+<%- include('partials/head', { title: 'zoption — audit' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+  <section class="card">
+    <h2>Audit trail
+      <small>every state transition, with the candle each entry was priced from</small>
+    </h2>
+    <% if (!events.length) { %>
+      <p class="muted">Nothing recorded yet.</p>
+    <% } else { %>
+      <table class="events">
+        <thead><tr><th>Time</th><th>Cycle</th><th>Leg</th><th>Event</th><th>Transition</th><th>Detail</th></tr></thead>
+        <tbody>
+        <% events.forEach(function (e) { %>
+          <tr>
+            <td><%= new Date(Number(e.ts_ms)).toLocaleTimeString() %></td>
+            <td><%= e.cycle_id || '' %></td>
+            <td><%= e.option_type || '' %></td>
+            <td><code><%= e.kind %></code></td>
+            <td><%= e.to_state ? (e.from_state + ' → ' + e.to_state) : '' %></td>
+            <td class="small muted">
+              <%= e.reason || '' %>
+              <% if (e.payload) { %>
+                <details><summary>payload</summary><pre><%= JSON.stringify(typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload, null, 2) %></pre></details>
+              <% } %>
+            </td>
+          </tr>
+        <% }); %>
+        </tbody>
+      </table>
+    <% } %>
+  </section>
+</main>
+
+<%- include('partials/foot') %>

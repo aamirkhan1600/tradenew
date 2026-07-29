@@ -1,0 +1,192 @@
+<%- include('partials/head', { title: 'zoption — dashboard' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <section class="strip">
+    <div class="tile">
+      <span class="k">Engine</span>
+      <b id="intent" class="v">—</b>
+    </div>
+    <div class="tile">
+      <span class="k">Broker</span>
+      <b id="broker" class="v">—</b>
+    </div>
+    <div class="tile">
+      <span class="k">Expiry</span>
+      <b id="expiry" class="v">—</b>
+    </div>
+    <div class="tile">
+      <span class="k">Spot at lock</span>
+      <b id="spot" class="v">—</b>
+    </div>
+    <div class="tile">
+      <span class="k">Quantity</span>
+      <b id="qty" class="v">—</b>
+    </div>
+    <!-- The NIFTY micro-trend filter. It decides WHICH SIDE may sell, never at
+         what price — doc/update-point.md. -->
+    <div class="tile">
+      <span class="k">NIFTY trend</span>
+      <b id="trend" class="v">—</b>
+      <span class="sub" id="trendsub"></span>
+    </div>
+    <div class="tile wide">
+      <span class="k">Net P&amp;L today</span>
+      <b id="pnl" class="v big">—</b>
+      <span class="sub" id="pnlsub">gross — · charges —</span>
+    </div>
+  </section>
+
+  <section class="controls">
+    <button id="start" class="go">Start</button>
+    <button id="pause" class="warn">Pause entries</button>
+    <button id="stop"  class="stop">Stop</button>
+    <span id="risknote" class="risknote"></span>
+  </section>
+
+  <!-- The locked strike. Both legs sit under one lock and it releases only when
+       both are flat — see doc/PROJECT_PLAN.md §2 R6. -->
+  <section id="cyclebox" class="card">
+    <h2>Locked strike <small id="lockedat"></small></h2>
+    <div id="legs" class="legs">
+      <p class="muted">No cycle is open. The engine selects an expiry and a strike, locks them,
+        and waits for that contract's own candle to close.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Audit trail <small>every state transition</small></h2>
+    <table class="events">
+      <thead><tr><th>Time</th><th>Leg</th><th>Event</th><th>Detail</th></tr></thead>
+      <tbody id="events"><tr><td colspan="4" class="muted">Waiting…</td></tr></tbody>
+    </table>
+  </section>
+
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(function () {
+  const rupee = (paise) => {
+    if (paise === null || paise === undefined) return '—';
+    const v = paise / 100;
+    return (v < 0 ? '-₹' : '₹') + Math.abs(v).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  };
+  const price = (paise) => (paise === null || paise === undefined ? '—' : (paise / 100).toFixed(2));
+  const set = (id, text) => { document.getElementById(id).textContent = text; };
+
+  // The state names a human needs to read at a glance, in the order they occur.
+  const STATE_LABEL = {
+    IDLE: 'idle',
+    WAIT_CANDLE: 'waiting for a candle close',
+    SELL_WORKING: 'sell limit working',
+    SELL_CANCELLING: 'cancelling',
+    POSITION_OPEN: 'position open',
+    TARGET_MOVING: 'moving the target',
+    EXITING: 'exiting',
+    DONE: 'flat',
+  };
+
+  const TREND_LABEL = {
+    STRONG_BULLISH: 'strong bullish',
+    STRONG_BEARISH: 'strong bearish',
+    NEUTRAL: 'neutral',
+    HIGH_VOLATILITY: 'volatile',
+    CHOPPY: 'choppy',
+    WEAKENING: 'momentum fading',
+    NO_DATA: 'no index data',
+    WARMING_UP: 'warming up',
+  };
+
+  const socket = io();
+
+  socket.on('state', (s) => {
+    set('intent', s.intent || '—');
+    set('broker', s.broker.status + (s.broker.ucc ? ' · ' + s.broker.ucc : ''));
+    set('expiry', s.cycle ? String(s.cycle.expiry).slice(0, 10) : '—');
+    set('spot', s.cycle && s.cycle.spotAtLock ? Number(s.cycle.spotAtLock).toFixed(0) : '—');
+    set('qty', s.cycle ? s.cycle.qty : '—');
+
+    const trend = document.getElementById('trend');
+    if (!s.trend) {
+      trend.textContent = 'off';
+      trend.className = 'v';
+      set('trendsub', '');
+    } else {
+      const allowed = [s.trend.allowCE ? 'CE' : null, s.trend.allowPE ? 'PE' : null]
+        .filter(Boolean).join(' + ');
+      trend.textContent = TREND_LABEL[s.trend.state] || s.trend.state;
+      trend.className = 'v ' + (s.trend.allowPE ? 'up' : s.trend.allowCE ? 'down' : '');
+      set('trendsub', allowed ? allowed + ' may sell' : 'no side may sell');
+    }
+
+    const pnl = document.getElementById('pnl');
+    pnl.textContent = rupee(s.risk.netPnlP);
+    pnl.className = 'v big ' + (s.risk.netPnlP > 0 ? 'up' : s.risk.netPnlP < 0 ? 'down' : '');
+    set('pnlsub', 'gross ' + rupee(s.risk.grossPnlP) + ' · charges ' + rupee(s.risk.chargesP)
+      + ' · ' + s.risk.trades + ' trades (' + s.risk.wins + 'W/' + s.risk.losses + 'L)');
+
+    const note = document.getElementById('risknote');
+    note.textContent = s.risk.disabled
+      ? 'Trading disabled today — ' + (s.risk.disabledReason || 'risk limit')
+      : (s.risk.consecutiveLosses ? s.risk.consecutiveLosses + ' consecutive losses' : '');
+    note.className = 'risknote ' + (s.risk.disabled ? 'down' : '');
+
+    document.getElementById('lockedat').textContent =
+      s.cycle ? 'locked ' + new Date(s.cycle.lockedAt).toLocaleTimeString() : '';
+
+    const box = document.getElementById('legs');
+    if (!s.legs || !s.legs.length) {
+      box.innerHTML = '<p class="muted">No cycle is open. The engine selects an expiry and a '
+        + "strike, locks them, and waits for that contract's own candle to close.</p>";
+      return;
+    }
+    box.innerHTML = s.legs.map(function (l) {
+      return '<div class="leg">'
+        + '<div class="leg-h"><b>' + l.optionType + ' ' + Number(l.strike).toFixed(0) + '</b>'
+        + '<span class="state s-' + l.state + '">' + (STATE_LABEL[l.state] || l.state) + '</span></div>'
+        + '<div class="leg-g">'
+        + row('Sell limit', price(l.sellP))
+        + row('Filled at', price(l.filledP))
+        + row('Target', l.targetP == null && l.filledP != null ? 'trailing' : price(l.targetP))
+        + row('Stop', price(l.slP))
+        + row('Confirmations', l.confirmations == null ? '—' : l.confirmations)
+        + row('Requotes', l.requotes == null ? '—' : l.requotes)
+        + '</div></div>';
+    }).join('');
+  });
+
+  function row(k, v) {
+    return '<span class="k">' + k + '</span><span class="v">' + v + '</span>';
+  }
+
+  socket.on('events', (rows) => {
+    const body = document.getElementById('events');
+    if (body.querySelector('.muted')) body.innerHTML = '';
+    for (const e of rows) {
+      const tr = document.createElement('tr');
+      const detail = e.to_state ? (e.from_state + ' → ' + e.to_state) : (e.reason || '');
+      tr.innerHTML = '<td>' + new Date(Number(e.ts_ms)).toLocaleTimeString() + '</td>'
+        + '<td>' + (e.option_type || '') + '</td>'
+        + '<td><code>' + e.kind + '</code></td>'
+        + '<td>' + escapeHtml(detail) + '</td>';
+      body.prepend(tr);
+    }
+    while (body.children.length > 120) body.removeChild(body.lastChild);
+  });
+
+  function escapeHtml(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  for (const [id, path] of [['start', '/api/start'], ['pause', '/api/pause'], ['stop', '/api/stop']]) {
+    document.getElementById(id).addEventListener('click', function () {
+      fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    });
+  }
+}());
+</script>
+
+<%- include('partials/foot') %>

@@ -1,0 +1,73 @@
+<%- include('partials/head', { title: 'zoption — trades' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <section class="card">
+    <h2>Positions <small><%= tradeDate %> — net of charges</small></h2>
+    <% if (!positions.length) { %>
+      <p class="muted">Nothing today.</p>
+    <% } else { %>
+      <table>
+        <thead><tr>
+          <th>Leg</th><th>Contract</th><th>Qty</th><th>Entry</th><th>Exit</th>
+          <th>Target</th><th>Stop</th><th>Gross</th><th>Charges</th><th>Net</th><th>Reason</th><th>Closed</th>
+        </tr></thead>
+        <tbody>
+        <% positions.forEach(function (p) { %>
+          <tr>
+            <td><%= p.option_type %></td>
+            <td><%= p.symbol %></td>
+            <td><%= p.qty %></td>
+            <td><%= money.formatPrice(p.entry_p) %></td>
+            <td><%= money.formatPrice(p.exit_p) %></td>
+            <td><%= money.formatPrice(p.target_p) %></td>
+            <td><%= money.formatPrice(p.sl_p) %></td>
+            <td><%= money.formatInr(p.gross_pnl_p) %></td>
+            <td class="muted"><%= money.formatInr(p.charges_p) %></td>
+            <td class="<%= p.net_pnl_p > 0 ? 'up' : p.net_pnl_p < 0 ? 'down' : '' %>">
+              <b><%= money.formatInr(p.net_pnl_p) %></b>
+            </td>
+            <td><code><%= p.exit_reason || '—' %></code></td>
+            <td><%= p.closed_at ? new Date(p.closed_at).toLocaleTimeString() : 'open' %></td>
+          </tr>
+        <% }); %>
+        </tbody>
+      </table>
+    <% } %>
+  </section>
+
+  <section class="card">
+    <h2>Orders <small>the last 100 — `client_ref` is the idempotency key</small></h2>
+    <% if (!orders.length) { %>
+      <p class="muted">No orders yet.</p>
+    <% } else { %>
+      <table>
+        <thead><tr>
+          <th>Ref</th><th>Stage</th><th>Side</th><th>Type</th><th>Limit</th>
+          <th>Qty</th><th>Filled</th><th>At</th><th>Status</th><th>Reason</th><th>Time</th>
+        </tr></thead>
+        <tbody>
+        <% orders.forEach(function (o) { %>
+          <tr>
+            <td><code><%= o.client_ref %></code></td>
+            <td><%= o.stage %></td>
+            <td class="<%= o.side === 'SELL' ? 'down' : 'up' %>"><%= o.side %></td>
+            <td><%= o.order_type %></td>
+            <td><%= o.order_type === 'L' ? money.formatPrice(o.limit_price_p) : '—' %></td>
+            <td><%= o.qty %></td>
+            <td><%= o.filled_qty %></td>
+            <td><%= money.formatPrice(o.filled_price_p) %></td>
+            <td><span class="badge b-<%= o.status %>"><%= o.status %></span></td>
+            <td class="muted small"><%= o.reason || '' %></td>
+            <td><%= new Date(o.created_at).toLocaleTimeString() %></td>
+          </tr>
+        <% }); %>
+        </tbody>
+      </table>
+    <% } %>
+  </section>
+
+</main>
+
+<%- include('partials/foot') %>

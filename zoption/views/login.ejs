@@ -1,0 +1,15 @@
+<%- include('partials/head', { title: 'zoption — sign in' }) %>
+
+<main class="centre">
+  <form class="card auth" method="post" action="/login">
+    <h1>zoption</h1>
+    <p class="muted">NIFTY option offset scalper</p>
+    <% if (error) { %><p class="error"><%= error %></p><% } %>
+    <label>Email<input type="email" name="email" required autofocus autocomplete="username"></label>
+    <label>Password<input type="password" name="password" required autocomplete="current-password"></label>
+    <button type="submit" class="go">Sign in</button>
+    <p class="hint">On a fresh install the first credentials entered create the account.</p>
+  </form>
+</main>
+
+<%- include('partials/foot') %>
