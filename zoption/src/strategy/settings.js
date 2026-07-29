@@ -187,9 +187,36 @@ function validate(raw) {
     }
   }
 
-  if (Number(s.stopLoss) <= Number(s.target)) {
-    warnings.push(`stopLoss (${s.stopLoss}) is not larger than target (${s.target}) — `
-      + 'the strategy needs a hit rate above 50% just to break even before charges');
+  // The economics, stated as the number an operator can act on.
+  //
+  // The old check here fired when `stopLoss <= target` — the FAVOURABLE
+  // direction — and said nothing about the default (stop 2.00 against a target
+  // of 1.00), which is the dangerous one. Worse, `breakevenNote` reported that
+  // configuration as "covered" because 1.00 > the ~0.65 of charges, which reads
+  // as reassurance for a setup that has to be right 88% of the time.
+  if (!errors.length) {
+    const qty = Math.max(1, Number(s.lots) * 75);          // NIFTY lot, for the estimate
+    const entryP = money.toPaise(s.targetPremium || 12) + money.toPaise(s.sellOffset);
+    const need = money.requiredWinRate({
+      entryPaise: entryP, qty,
+      targetPaise: money.toPaise(s.target),
+      stopPaise: money.toPaise(s.stopLoss),
+    });
+
+    if (need.rate === null) {
+      errors.push(`a winning trade LOSES money at this size: target ₹${s.target} on `
+        + `${qty} qty nets ${money.formatInr(need.winP)} after ${money.formatInr(need.chargesP)} `
+        + 'of charges. Raise the target or the lot size.');
+    } else if (need.rate >= 0.75) {
+      warnings.push(`this configuration needs a ${(need.rate * 100).toFixed(0)}% win rate to `
+        + `break even: a win nets ${money.formatInr(need.winP)} and a loss `
+        + `${money.formatInr(need.lossP)} on ${qty} qty, because charges of `
+        + `${money.formatInr(need.chargesP)} are paid on BOTH. Widen the target, tighten the `
+        + 'stop, or trade more lots — see doc/HOW-IT-WORKS.md §12.');
+    } else if (need.rate >= 0.6) {
+      warnings.push(`this configuration needs a ${(need.rate * 100).toFixed(0)}% win rate to `
+        + `break even (win ${money.formatInr(need.winP)} vs loss ${money.formatInr(need.lossP)})`);
+    }
   }
 
   if (!errors.length) {
@@ -369,12 +396,23 @@ function breakevenNote(s, lotSize) {
   const qty = Math.max(1, Number(s.lots) * Number(lotSize || 75));
   const entryP = money.toPaise(s.targetPremium || 12) + money.toPaise(s.sellOffset);
   const be = money.breakevenPaise({ entryPaise: entryP, qty, assumeTargetPaise: money.toPaise(s.target) });
+  const need = money.requiredWinRate({
+    entryPaise: entryP, qty,
+    targetPaise: money.toPaise(s.target),
+    stopPaise: money.toPaise(s.stopLoss),
+  });
   return {
     qty,
     chargesP: be.chargesPaise,
     breakevenPointsP: be.pointsPaise,
     targetP: money.toPaise(s.target),
+    // `covered` only says a win is profitable at all. It is NOT a verdict on the
+    // strategy — a covered target with a wide stop can still need a hit rate no
+    // one achieves, which is what `requiredWinRate` is for.
     covered: money.toPaise(s.target) > be.pointsPaise,
+    requiredWinRate: need.rate,
+    winP: need.winP,
+    lossP: need.lossP,
   };
 }
 

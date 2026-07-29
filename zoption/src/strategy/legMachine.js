@@ -515,6 +515,31 @@ function reduce(leg, event, cfg) {
     }
 
     case 'TREND_REVERSED': {
+      // A WORKING sell is cancelled whenever the trend turns, independently of
+      // `exitOnReversal` — that setting governs open positions, and this is
+      // about not opening one at all.
+      //
+      // This matters more than it looks. The entry is a LIMIT ABOVE the market,
+      // so a PE sell fills when PE premium RISES — which is when NIFTY FALLS.
+      // The filter permits PE selling in an uptrend and the resting order then
+      // fills on the downturn: the fill is selected for the moment the reason
+      // to be there has gone. Gating only at placement leaves that wide open.
+      if (leg.state === STATES.SELL_WORKING) {
+        return {
+          state: STATES.SELL_CANCELLING,
+          // NOT haltAfterCancel: the leg goes back to waiting and may enter
+          // again when the trend returns. This is a withdrawn quote, not a stop.
+          patch: {},
+          actions: [
+            { type: 'CANCEL_SELL', orderId: leg.sellOrderId },
+            log('TREND_REVERSAL', {
+              reason: event.reason,
+              note: 'cancelling a working sell — the trend that justified it has turned',
+            }),
+          ],
+        };
+      }
+
       // "Exit immediately if the last three 5s candles change direction." It is
       // not a stop-loss — this usually fires in profit, and it is the exit the
       // trail-only mode depends on.

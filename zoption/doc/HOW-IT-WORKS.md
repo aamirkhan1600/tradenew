@@ -23,8 +23,11 @@ candles gate *which side* may sell, and a dynamic target ladder lets a winner ru
 while that trend keeps confirming. Everything else — stops, timeouts, the
 square-off — reacts at tick speed.
 
-The strategy is unusually exposed to costs: a one-point target on one lot is
-mostly charges. Every P&L number the engine acts on is **net**.
+Every P&L number the engine acts on is **net**. How exposed the strategy is to
+costs depends entirely on the brokerage plan — on a flat per-order fee a
+one-point target on one lot is mostly charges; on a zero-brokerage plan (what
+this install is configured for) a round trip costs ~0.03 points and risk/reward
+is the only thing that matters. §12 has both cases.
 
 ---
 
@@ -274,6 +277,24 @@ absent rather than faked from a proxy.
 A verdict expires with its bar (5s + a small grace for the two builders' 250ms
 sweeps). A stale permission is worse than none.
 
+### The filter and the offset entry pull against each other
+
+Worth understanding before switching the filter on. The entry is a **limit above
+the market** — `close + offset` — so a PE sell fills only when PE premium
+**rises**, which is when NIFTY **falls**. The filter permits PE selling in an
+uptrend. So:
+
+- **The good reading.** You sell a premium spike caused by a dip *inside* an
+  uptrend, which is a better entry than selling into the fall.
+- **The bad reading.** If the dip is the start of a reversal, the fill arrives
+  exactly as the reason for the trade evaporates.
+
+That is why a **working sell is withdrawn the moment the trend turns**, not just
+gated at placement. Without it the fill is systematically selected for the worst
+moment — the gate says yes at the close, the order rests, and it only executes if
+the market moves against the thesis. Expect a lower fill rate with the filter on;
+that is the mechanism working, not a fault.
+
 **`WARMING_UP` and `NO_DATA` are not reversals.** They are an absence of
 information, not a change of direction — closing a live short on one would hand
 the market a free exit every time a bar goes quiet.
@@ -349,6 +370,10 @@ index REVERSES  → MARKET BUY at 17.80
 | Trend reversal | the verdict no longer permits this side | MARKET |
 | Timeout | `positionTimeout` since the fill | MARKET |
 | Square-off | past `squareOffAt` | MARKET |
+
+A trend reversal also **withdraws a working SELL** (§6) — that path cancels the
+resting limit and returns the leg to `WAIT_CANDLE`, independently of
+`exitOnReversal`, which governs open positions only.
 
 **The maximum hold outranks the ladder.** A trailing winner is still a naked
 short, and an uncapped holding time is a different risk profile than the one the
@@ -524,18 +549,56 @@ types a number, and where one is displayed.
 `roundToTickPaise` is the **only** rounding boundary between a computed price and
 an order. An off-tick limit is rejected outright by the exchange.
 
-Brokerage is a **flat fee per order**, so a round trip's cost is dominated by a
-constant and the breakeven *move* scales as roughly 1/qty:
+Gross P&L on this strategy is misleading by roughly the size of the target
+itself, so **`net_pnl_p` is what the risk manager reads and the dashboard
+shows**.
+
+### The break-even win rate — read this before going live
+
+"The target covers charges" is a much weaker statement than it sounds, and it
+was the only thing the engine used to report. Charges are paid **in full on
+losers as well as winners**, so what actually decides viability is:
 
 ```
-1 lot  (75)  → ~0.75 points to break even
-2 lots (150) → ~0.40 points
+p · netWin + (1 − p) · netLoss = 0      p = −netLoss / (netWin − netLoss)
 ```
 
-Against a 1.00-point target, that is most of the edge. Gross P&L on this strategy
-is misleading by roughly the size of the target itself, so **`net_pnl_p` is what
-the risk manager reads and the dashboard shows**. The engine logs a warning at
-boot if the configured target does not cover the round trip.
+**The answer depends entirely on your brokerage plan**, and the two cases are
+qualitatively different, not just numerically:
+
+| | per-order fee (₹20/order) | **zero brokerage (this install's `.env`)** |
+|---|---|---|
+| Round-trip cost | ~0.65 points at 1 lot | **~0.03 points, any size** |
+| Scales with size? | yes — cost per point ∝ 1/qty | no — purely proportional to turnover |
+| What dominates | charges | **risk/reward** |
+| `target 1.0 / stop 2.0` | 88% | 67.5% |
+
+On a **flat-fee** plan a one-point target on one lot is mostly charges, and lot
+size is the strongest lever. On a **zero-brokerage** plan — what this install is
+configured for — costs are almost irrelevant and the required win rate collapses
+to very nearly `stop / (stop + target)`. Sold at 13.00, lot of 75:
+
+| target | stop | net win | net loss | break-even |
+|---:|---:|---:|---:|---:|
+| 1.0 | 2.0 | ₹73 | −₹152 | 67.5% ← the source documents' pair |
+| 1.0 | 1.5 | ₹73 | −₹114 | 61.0% |
+| 1.0 | 1.0 | ₹73 | −₹77 | 51.2% |
+| **1.5** | **1.5** | **₹111** | **−₹114** | **50.8%** ← the shipped default |
+| 2.0 | 2.0 | ₹148 | −₹152 | 50.6% |
+| 2.0 | 3.0 | ₹148 | −₹227 | 60.5% |
+
+**A stop wider than the target is the whole problem.** The documents' 1.0/2.0
+loses two to win one and needs to be right two times in three for nothing. The
+shipped default is symmetric at 1.5/1.5 — a coin flip plus a rounding error —
+and keeps more noise tolerance in the stop than squeezing to 1.0/1.0 would.
+
+This is also why `dynamicTarget` is an economic feature rather than a cosmetic
+one: a ladder that turns typical winners into 2–3 points lowers the required rate
+against an unchanged stop.
+
+`money.requiredWinRate()` computes it from whatever charge schedule is loaded,
+the settings validator warns above 60% and loudly above 75%, and the engine
+prints it at every live boot.
 
 ---
 
@@ -586,8 +649,8 @@ config describes. The API refuses a write while a cycle is open.
   "trendMinScore": 5,               // out of 5, every bar; 0 = direction only
 
   // exits — tick driven
-  "target": 1.0,
-  "stopLoss": 2.0,
+  "target": 1.5,                    // symmetric with the stop on purpose: see §12
+  "stopLoss": 1.5,
   "positionTimeout": 60,            // outranks the ladder, always
 
   // dynamic target and trailing stop
@@ -604,8 +667,6 @@ config describes. The API refuses a write while a cycle is open.
   "squareOffAt": "15:15",
 
   // risk
-  "maxOpenCE": 1,
-  "maxOpenPE": 1,
   "marketMovePause": 40,            // NIFTY points…
   "marketMoveWindow": 30,           // …within this many seconds
   "cooldownAfterSL": 300,
@@ -621,6 +682,11 @@ config describes. The API refuses a write while a cycle is open.
 
 Everything optional ships **off**. An upgrade never switches on a feature that
 changes what a trade is worth.
+
+`maxOpenCE` / `maxOpenPE` were removed: nothing ever read them, and the limit
+they described is already structural — `uk_leg_cycle_type (cycle_id,
+option_type)` permits exactly one CE and one PE leg per cycle. A setting that
+cannot change anything is worse than no setting.
 
 **Settings that are refused, not ignored.** `useLiveAsk/Bid/LTP: true` and
 `lockStrike: false` are not preferences the engine can honour — they are requests

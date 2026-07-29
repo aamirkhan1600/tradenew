@@ -102,6 +102,36 @@ function breakevenPaise({ entryPaise, qty, assumeTargetPaise = 0 }) {
   return { chargesPaise: total, pointsPaise: Math.ceil(total / q), qty: q };
 }
 
+// The number that decides whether this strategy can work at all.
+//
+// Charges are per ROUND TRIP and dominated by a flat brokerage, so they are paid
+// in full on a winner and on a loser alike. That asymmetry is brutal when the
+// target is small and the stop is not: a one-point target against a two-point
+// stop on one lot nets about +26 on a win and -199 on a loss, which needs to be
+// right almost nine times in ten merely to stand still.
+//
+// `breakevenPaise` answers "do charges eat the target". This answers the
+// question an operator actually needs answered, which is a different one:
+//
+//     p · netWin + (1 - p) · netLoss = 0   ->   p = -netLoss / (netWin - netLoss)
+//
+// Returns null when a win is not profitable at all — no hit rate saves it.
+function requiredWinRate({ entryPaise, qty, targetPaise, stopPaise }) {
+  const q = Math.max(1, Math.trunc(Number(qty) || 1));
+  const win = shortPnl({ entryPaise, exitPaise: entryPaise - Math.round(targetPaise), qty: q });
+  const loss = shortPnl({ entryPaise, exitPaise: entryPaise + Math.round(stopPaise), qty: q });
+
+  if (win.netPaise <= 0) {
+    return { rate: null, winP: win.netPaise, lossP: loss.netPaise, chargesP: win.chargesPaise };
+  }
+  return {
+    rate: -loss.netPaise / (win.netPaise - loss.netPaise),
+    winP: win.netPaise,
+    lossP: loss.netPaise,
+    chargesP: win.chargesPaise,
+  };
+}
+
 /* ------------------------------------------------------------------ P&L -- */
 
 // Realised P&L of one short round trip, in paise. A short profits when the
@@ -135,7 +165,7 @@ function formatPrice(paise) {
 
 module.exports = {
   toPaise, toRupees, roundToTickPaise,
-  charges, roundTripCharges, breakevenPaise,
+  charges, roundTripCharges, breakevenPaise, requiredWinRate,
   shortPnl, openPnl,
   formatInr, formatPrice,
 };

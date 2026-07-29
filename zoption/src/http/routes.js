@@ -194,7 +194,6 @@ api.post('/settings', wrap(async (req, res) => {
   // rather than storing "1.0" and hoping every reader parses it the same way.
   const numeric = ['atmOffset', 'targetPremium', 'premiumTolerance', 'sellOffset', 'target',
     'stopLoss', 'pendingTimeout', 'positionTimeout', 'legEntryTimeout', 'cycleMaxAge', 'lots',
-    'maxOpenCE', 'maxOpenPE',
     'marketMovePause', 'marketMoveWindow', 'cooldownAfterSL', 'maxDailyLoss',
     'maxDailyProfit', 'maxConsecutiveLoss', 'maxCyclesPerDay',
     'trendConfirmBars', 'trendBodyPct', 'trendCloseNearPct', 'trendMaxRangePoints',

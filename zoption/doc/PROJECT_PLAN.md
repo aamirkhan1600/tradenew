@@ -546,8 +546,11 @@ New or changed keys marked.
   "trendMinScore": 5,                 // out of 5, every bar; 0 = direction only
 
   // ---- exits: tick driven ----
-  "target": 1.0,
-  "stopLoss": 2.0,
+  // The documents say 1.0 / 2.0. Shipped as 1.5 / 1.5 — losing two to win one
+  // needs a 67% hit rate, and on a zero-brokerage plan that is a risk/reward
+  // choice, not a charges one. See doc/HOW-IT-WORKS.md §12.
+  "target": 1.5,
+  "stopLoss": 1.5,
   "positionTimeout": 60,               // outranks the ladder, always
 
   // ---- dynamic target and trailing stop (R9, new) ----

@@ -12,6 +12,7 @@
 const config = require('./config');
 const logger = require('./core/logger');
 const db = require('./core/db');
+const money = require('./core/money');
 const repo = require('./repositories');
 const settingsService = require('./strategy/settings');
 const brokerRegistry = require('./broker');
@@ -97,6 +98,21 @@ async function boot() {
         qty: note.qty,
         note: 'every "winning" trade at this size books a realised loss',
       });
+    }
+    // Printed every live boot, covered or not. "The target covers charges" is a
+    // much weaker statement than it sounds, and this is the number that decides
+    // whether the configuration can make money.
+    if (note.requiredWinRate != null) {
+      const pct = `${(note.requiredWinRate * 100).toFixed(0)}%`;
+      const line = {
+        needs: pct, win: money.formatInr(note.winP), loss: money.formatInr(note.lossP),
+        qty: note.qty, target: `₹${settings.target}`, stop: `₹${settings.stopLoss}`,
+      };
+      if (note.requiredWinRate >= 0.75) {
+        logger.warn(`engine: this configuration must win ${pct} of its trades to break even`, line);
+      } else {
+        logger.info(`engine: break-even win rate ${pct}`, line);
+      }
     }
   }
 

@@ -143,8 +143,21 @@ const DEFAULT_SETTINGS = {
   trailGap: 0.5,
   exitOnReversal: false,
 
-  target: 1.0,
-  stopLoss: 2.0,
+  // Both 1.5, deliberately symmetric.
+  //
+  // The source documents specify 1.0 and 2.0 — losing two to win one, which
+  // needs a 67% hit rate to break even and has nothing to do with charges: on a
+  // zero-brokerage plan a round trip costs about 0.03 points, so risk/reward is
+  // very nearly the whole story and the required win rate is just
+  // `stop / (stop + target)`.
+  //
+  // 1.5 / 1.5 asks for a coin flip (50.8%) instead of two-in-three, and keeps
+  // more noise tolerance in the stop than tightening to 1.0 / 1.0 would. Widen
+  // the target rather than the stop if you want a lower required rate; see
+  // doc/HOW-IT-WORKS.md §12, and `dynamicTarget` for letting winners run past
+  // the first rung.
+  target: 1.5,
+  stopLoss: 1.5,
   positionTimeout: 60,
 
   lots: 1,
@@ -153,8 +166,10 @@ const DEFAULT_SETTINGS = {
   sessionEnd: '15:10',
   squareOffAt: '15:15',
 
-  maxOpenCE: 1,
-  maxOpenPE: 1,
+  // maxOpenCE / maxOpenPE are deliberately absent. They were config for a limit
+  // the SCHEMA already enforces — `uk_leg_cycle_type (cycle_id, option_type)`
+  // permits exactly one CE and one PE leg per cycle — so nothing ever read them.
+  // A setting that cannot change anything is worse than no setting.
   marketMovePause: 40,
   marketMoveWindow: 30,
   cooldownAfterSL: 300,
@@ -200,6 +215,23 @@ async function backfillSettings(conn) {
     if (payload.trendTimeframe === '15s') {
       payload.trendTimeframe = '5s';
       added.push('trendTimeframe→5s');
+    }
+
+    // The shipped target/stop changed from 1.0/2.0 to 1.5/1.5 — losing two to
+    // win one needs a 67% hit rate, and on a zero-brokerage plan that is a
+    // risk/reward choice rather than a charges one.
+    //
+    // Only moved when the row still holds the ORIGINAL pair untouched. An
+    // operator who has tuned these has made a decision, and a migration must not
+    // quietly overrule it. Announced loudly either way: this is a live risk
+    // parameter, not a formatting change.
+    if (Number(payload.target) === 1.0 && Number(payload.stopLoss) === 2.0) {
+      payload.target = 1.5;
+      payload.stopLoss = 1.5;
+      added.push('target 1.0→1.5, stopLoss 2.0→1.5');
+      console.log('  ! RISK PARAMETERS CHANGED: target 1.0 -> 1.5, stopLoss 2.0 -> 1.5');
+      console.log('    (the old pair needed a 67% win rate to break even; the new one 51%)');
+      console.log('    Change them back on /settings if that was deliberate.');
     }
 
     if (!added.length) continue;

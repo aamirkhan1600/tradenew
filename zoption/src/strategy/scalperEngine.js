@@ -643,11 +643,27 @@ class ScalperEngine extends EventEmitter {
   // the trailing stop and the maximum hold as it always was.
   async _driveOpenPositions(verdict) {
     if (!this.cycle) return;
-    if (!this.settings.dynamicTarget && !this.settings.exitOnReversal) return;
 
     const undecided = verdict.state === trendFilter.VERDICT_STATES.WARMING_UP
       || verdict.state === trendFilter.VERDICT_STATES.NO_DATA;
     if (undecided) return;
+
+    // A working SELL is withdrawn the moment the trend that justified it turns,
+    // whatever `dynamicTarget` and `exitOnReversal` say — those govern open
+    // positions. A resting limit is an entry decision, and the entry gate has
+    // just changed its mind.
+    for (const leg of [...this.legs.values()]) {
+      if (leg.state !== STATES.SELL_WORKING) continue;
+      const stillOurs = leg.optionType === 'CE' ? verdict.allowCE : verdict.allowPE;
+      if (stillOurs) continue;
+      await this._dispatch(leg, {
+        type: 'TREND_REVERSED',
+        reason: `the index is ${trendFilter.short(verdict.state)}: ${verdict.reason}`,
+        tsMs: Date.now(),
+      });
+    }
+
+    if (!this.settings.dynamicTarget && !this.settings.exitOnReversal) return;
 
     for (const leg of [...this.legs.values()]) {
       if (leg.state !== STATES.POSITION_OPEN && leg.state !== STATES.TARGET_MOVING) continue;

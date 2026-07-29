@@ -125,3 +125,42 @@ test('formatting is Indian and signed', () => {
   assert.equal(money.formatInr(null), '—');
   assert.equal(money.formatPrice(1240), '12.40');
 });
+
+/* -------------------------------------------- the number that decides it all */
+
+test('the break-even win rate exposes what "the target covers charges" hides', () => {
+  // The documented default: sold at 13.00, one lot, 1.00 target, 2.00 stop.
+  // The target DOES cover charges — and the setup still has to be right almost
+  // nine times in ten, because charges are paid on the losers too.
+  const need = money.requiredWinRate({
+    entryPaise: 1300, qty: 75, targetPaise: 100, stopPaise: 200,
+  });
+  assert.ok(need.rate > 0.85 && need.rate < 0.90, `got ${need.rate}`);
+  assert.ok(need.winP > 0, 'a win is profitable…');
+  assert.ok(Math.abs(need.lossP) > need.winP * 5, '…and a loss is many times larger');
+});
+
+test('widening the target moves the required win rate a long way', () => {
+  const at = (targetPts) => money.requiredWinRate({
+    entryPaise: 1300, qty: 75, targetPaise: targetPts * 100, stopPaise: 200,
+  }).rate;
+  assert.ok(at(1) > at(2), 'a wider target needs a lower hit rate');
+  assert.ok(at(2) > at(3));
+  assert.ok(at(3) < 0.6, 'three points against a two-point stop is a sane ratio');
+});
+
+test('size moves it too — the flat brokerage is amortised', () => {
+  const at = (lots) => money.requiredWinRate({
+    entryPaise: 1300, qty: 75 * lots, targetPaise: 100, stopPaise: 200,
+  }).rate;
+  assert.ok(at(1) > at(2) && at(2) > at(10), 'more lots, less charge drag per point');
+});
+
+test('a target that cannot pay for itself reports no rate at all', () => {
+  // 0.20 of premium on one lot does not cover a round trip. No hit rate saves it.
+  const need = money.requiredWinRate({
+    entryPaise: 1300, qty: 75, targetPaise: 20, stopPaise: 200,
+  });
+  assert.equal(need.rate, null);
+  assert.ok(need.winP <= 0, 'the "win" is a realised loss');
+});

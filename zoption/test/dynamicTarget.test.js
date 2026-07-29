@@ -210,6 +210,48 @@ test('a reversal exits through the same confirmed-cancel door', () => {
   assert.equal(exits[0].reason, EXIT_REASONS.REVERSAL);
 });
 
+test('a WORKING sell is withdrawn when the trend that justified it turns', () => {
+  // The entry is a LIMIT ABOVE the market, so a PE sell fills when PE premium
+  // RISES — which is when NIFTY FALLS. Gating only at placement means the fill
+  // is selected for the moment the reason to be there has gone.
+  const working = leg({
+    state: STATES.SELL_WORKING, sellOrderId: 11, sellPriceP: 1340, sellPlacedAt: T0,
+  });
+  const r = m.reduce(working, { type: 'TREND_REVERSED', reason: 'now choppy', tsMs: T0 + 3000 }, dyn());
+
+  assert.equal(r.state, STATES.SELL_CANCELLING);
+  assert.equal(actionsOf(r.actions, 'CANCEL_SELL').length, 1);
+  assert.equal(logsOf(r.actions, 'TREND_REVERSAL').length, 1);
+  assert.notEqual(r.patch.haltAfterCancel, true, 'it may enter again when the trend returns');
+});
+
+test('withdrawing a working sell does not depend on exitOnReversal', () => {
+  // That setting governs open POSITIONS. A resting limit is an entry decision,
+  // and the entry gate has just changed its mind.
+  const working = leg({ state: STATES.SELL_WORKING, sellOrderId: 11, sellPlacedAt: T0 });
+  const r = m.reduce(working, { type: 'TREND_REVERSED', reason: 'turned', tsMs: T0 + 3000 },
+    dyn({ exitOnReversal: false }));
+  assert.equal(r.state, STATES.SELL_CANCELLING);
+  assert.equal(actionsOf(r.actions, 'CANCEL_SELL').length, 1);
+});
+
+test('a withdrawn sell goes back to waiting, not to DONE', () => {
+  const working = leg({ state: STATES.SELL_WORKING, sellOrderId: 11, sellPlacedAt: T0 });
+  const cancelling = m.reduce(working, { type: 'TREND_REVERSED', reason: 'turned', tsMs: T0 }, dyn());
+  const after = m.afterSellCancel({ ...working, ...cancelling.patch, state: cancelling.state }, T0 + 100);
+
+  assert.equal(after.state, STATES.WAIT_CANDLE);
+  assert.equal(after.patch.sellPriceP, null);
+});
+
+test('a trend reversal never touches a leg that is not exposed to it', () => {
+  for (const state of [STATES.IDLE, STATES.WAIT_CANDLE, STATES.DONE, STATES.SELL_CANCELLING]) {
+    const r = m.reduce(leg({ state }), { type: 'TREND_REVERSED', reason: 'x', tsMs: T0 }, dyn());
+    assert.equal(r.state, state, `${state} must be left alone`);
+    assert.equal(r.actions.length, 0);
+  }
+});
+
 test('exitOnReversal off leaves the position to its target, stop and clock', () => {
   const r = m.reduce(open(), { type: 'TREND_REVERSED', reason: 'choppy', tsMs: T0 + 20000 },
     dyn({ exitOnReversal: false }));
