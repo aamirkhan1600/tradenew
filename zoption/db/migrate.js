@@ -85,6 +85,66 @@ async function patch(conn) {
   if (await tableExists('orders')) {
     await addIndex(conn, 'orders', 'idx_orders_cycle', 'KEY idx_orders_cycle (cycle_id, stage)');
   }
+
+  // Bars downloaded from Yahoo to give the charts the history Kotak has no
+  // endpoint for. Defaulting to LIVE is correct for every row that already
+  // exists: everything written before this column was assembled here from the
+  // tick stream.
+  if (await tableExists('candles')) {
+    await addColumn(conn, 'candles', 'source',
+      "source ENUM('LIVE','BACKFILL') NOT NULL DEFAULT 'LIVE'");
+    await rekeyIndexCandles(conn);
+  }
+}
+
+// Move index candles from the numeric exchange token onto the NAME.
+//
+// Kotak's quotes API addresses a cash-segment index by name — `nse_cm|26000`
+// answers 200 with an EMPTY array while `nse_cm|Nifty 50` answers with a price
+// (verified against the live gateway). `instrumentMaster.indexInstrument` was
+// preferring the numeric token, which made the index unquotable and took the
+// spot price, the ATM and the whole trend-filter bar series down with it.
+//
+// Now that the name is authoritative, any history already stored under the
+// numeric token is orphaned — the chart would look under "Nifty 50" and find
+// nothing. This moves it rather than making the operator re-download a decade
+// of daily bars.
+//
+// Idempotent: after the first run there is nothing left under the old token.
+// Rows are only moved where the destination bucket does not already exist, so a
+// bar this platform recorded live can never be overwritten by a moved one.
+const INDEX_QUOTE_NAMES = {
+  NIFTY: 'Nifty 50',
+  BANKNIFTY: 'Nifty Bank',
+  FINNIFTY: 'Nifty Fin Service',
+  MIDCPNIFTY: 'Nifty Midcap Select',
+};
+
+async function rekeyIndexCandles(conn) {
+  for (const [underlying, name] of Object.entries(INDEX_QUOTE_NAMES)) {
+    const [rows] = await conn.query(
+      "SELECT token FROM instruments WHERE underlying = ? AND option_type = 'IDX' LIMIT 1",
+      [underlying]);
+    const numeric = rows[0]?.token;
+    if (!numeric || numeric === name) continue;
+
+    const [existing] = await conn.query(
+      'SELECT COUNT(*) AS n FROM candles WHERE token = ?', [numeric]);
+    if (!existing[0].n) continue;
+
+    const [res] = await conn.query(
+      `UPDATE IGNORE candles SET token = ? WHERE token = ?`, [name, numeric]);
+    // UPDATE IGNORE skips a row whose destination bucket already exists. Those
+    // are duplicates of something already held, so dropping them is correct.
+    const [leftover] = await conn.query(
+      'SELECT COUNT(*) AS n FROM candles WHERE token = ?', [numeric]);
+    if (leftover[0].n) {
+      await conn.query('DELETE FROM candles WHERE token = ?', [numeric]);
+    }
+    console.log(`  + candles: re-keyed ${res.affectedRows} ${underlying} bars from `
+      + `"${numeric}" to "${name}"`
+      + (leftover[0].n ? ` (dropped ${leftover[0].n} already held under the name)` : ''));
+  }
 }
 
 // The default settings row. Written only when absent, so an operator's edits

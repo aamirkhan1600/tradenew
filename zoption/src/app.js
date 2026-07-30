@@ -40,6 +40,20 @@ app.use(express.urlencoded({ extended: false, limit: '256kb' }));
 app.use(cookieParser());
 app.use('/static', express.static(path.join(__dirname, '..', 'public'), { maxAge: '1h' }));
 
+// The indicator and pattern libraries are ONE implementation shared by the
+// server and the browser — see the header of src/shared/indicators.js. They are
+// served from src/ rather than copied into public/ so there is no build step to
+// forget and no second copy to drift.
+app.use('/static/shared', express.static(path.join(__dirname, 'shared'), { maxAge: '1h' }));
+
+// TradingView Lightweight Charts, served from node_modules rather than vendored
+// into the repository. The CSP below allows scripts from 'self' only — no CDN,
+// which is the point: a trading terminal that stops drawing because someone
+// else's CDN is down is not a terminal.
+app.use('/static/vendor', express.static(
+  path.join(__dirname, '..', 'node_modules', 'lightweight-charts', 'dist'),
+  { maxAge: '7d', immutable: true }));
+
 // Views format prices and money in a dozen places; giving them the helpers
 // beats re-deriving the formatting in EJS.
 app.locals.money = money;

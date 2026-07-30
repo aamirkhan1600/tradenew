@@ -295,6 +295,81 @@ const candles = {
     return rows.reverse();
   },
 
+  // A window, ascending. The chart asks for a time range rather than "the last
+  // N" because a 1-hour bar is rebuilt from sixty 1-minute rows: asking for
+  // "the last 120" of the base series would return two hours and silently draw
+  // a chart two bars long.
+  async range(token, timeframe, fromMs, toMs, limit = 5000) {
+    const rows = await db.query(
+      `SELECT * FROM candles
+        WHERE token = ? AND timeframe = ? AND bucket_start >= ? AND bucket_start < ?
+        ORDER BY bucket_start DESC LIMIT ?`,
+      [String(token), timeframe, time.toMysql(fromMs), time.toMysql(toMs),
+        Math.max(1, Math.trunc(limit))]);
+    return rows.reverse();
+  },
+
+  // Bulk insert-or-ignore for the terminal, which closes a bar on every tracked
+  // instrument at the same instant. Same semantics as insert(): a bucket is
+  // written once and never rewritten.
+  //
+  // That last part is what makes a backfill safe to run at any time. A bucket
+  // this platform assembled from its own tick stream ALWAYS wins over a
+  // downloaded one, because it was already there and `ON DUPLICATE KEY UPDATE
+  // id = id` refuses to overwrite it. A backfill fills gaps; it never revises
+  // history the engine may have traded on.
+  async insertMany(rows) {
+    if (!rows.length) return 0;
+    let written = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const values = chunk.map(() => '(?,?,?,?,?,?,?,?,?,?)').join(',');
+      const params = [];
+      for (const r of chunk) {
+        params.push(String(r.token), r.timeframe, time.toMysql(r.bucketStart),
+          r.openP, r.highP, r.lowP, r.closeP, r.tickCount, r.synthetic ? 1 : 0,
+          r.source === 'BACKFILL' ? 'BACKFILL' : 'LIVE');
+      }
+      const res = await db.query(
+        `INSERT INTO candles (token, timeframe, bucket_start, open_p, high_p, low_p, close_p, tick_count, synthetic, source)
+         VALUES ${values}
+         ON DUPLICATE KEY UPDATE id = id`, params);
+      written += res.affectedRows || 0;
+    }
+    return written;
+  },
+
+  // What is stored for one series, so a backfill can report what it added and
+  // the terminal can say where its chart came from.
+  async coverage(token, timeframe) {
+    const row = await db.queryOne(
+      `SELECT COUNT(*) AS bars,
+              SUM(source = 'BACKFILL') AS backfilled,
+              MIN(bucket_start) AS first_bar,
+              MAX(bucket_start) AS last_bar
+         FROM candles WHERE token = ? AND timeframe = ?`,
+      [String(token), timeframe]);
+    if (!row || !row.bars) return { bars: 0, backfilled: 0, firstBar: null, lastBar: null };
+    return {
+      bars: Number(row.bars),
+      backfilled: Number(row.backfilled || 0),
+      firstBar: time.fromMysql(row.first_bar),
+      lastBar: time.fromMysql(row.last_bar),
+    };
+  },
+
+  // Only the downloaded rows. A re-import after fixing a mapping bug should not
+  // require deleting bars this platform recorded itself.
+  async purgeBackfill(token, timeframe = null) {
+    const res = timeframe
+      ? await db.query(
+        "DELETE FROM candles WHERE token = ? AND timeframe = ? AND source = 'BACKFILL'",
+        [String(token), timeframe])
+      : await db.query(
+        "DELETE FROM candles WHERE token = ? AND source = 'BACKFILL'", [String(token)]);
+    return res.affectedRows || 0;
+  },
+
   async purgeOlderThan(days) {
     const res = await db.query(
       'DELETE FROM candles WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',

@@ -122,6 +122,32 @@ const config = {
     minTicks: int('CANDLE_MIN_TICKS', 2),
   },
 
+  // The read-only trading terminal (doc/index-option-chaine.md). It runs in the
+  // WEB process and opens a second market-data socket and quote poller against
+  // the same Kotak account as the engine — the two processes have separate token
+  // buckets and Kotak's limit is per account, so these numbers add to the
+  // engine's. Everything here is lazy: nothing runs until a browser opens
+  // /terminal.
+  terminal: {
+    // The option chain's refresh, from the specification. Faster than the quote
+    // poller's own cadence buys nothing — the gateway would answer with the same
+    // prices twice.
+    chainRefreshMs: int('TERMINAL_CHAIN_MS', 1000),
+    // Strikes either side of the money. ±10 is 21 strikes, 42 contracts, two
+    // batched quote requests per second.
+    defaultRange: int('TERMINAL_STRIKE_RANGE', 10),
+    // The hard cap the API clamps a request to. ±50 would be 202 instruments —
+    // nine requests a second, which would starve the order path of its budget.
+    maxRange: int('TERMINAL_MAX_RANGE', 20),
+    // The risk-free rate the greeks are modelled at. Every greek in the terminal
+    // is computed from the last traded price because Kotak sends none; the rate
+    // moves delta by well under a hundredth, but IV and rho read off it directly.
+    riskFreeRate: num('TERMINAL_RISK_FREE_RATE', 6.5) / 100,
+    // Quote India VIX alongside the chain. Off-switchable because it is asked
+    // for by name rather than by token and not every gateway accepts that.
+    vix: bool('TERMINAL_VIX', true),
+  },
+
   // NSE F&O options charge schedule. Approximations for net P&L; the broker's
   // contract note remains authoritative.
   charges: {

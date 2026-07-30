@@ -282,11 +282,24 @@ function validate(raw) {
       // unless the streaming socket is genuinely delivering.
       const pollSec = Math.max(0.001, config.neo.pollMs / 1000);
       const worstCaseTicks = Math.floor(trendSec / pollSec);
-      if (worstCaseTicks < Number(s.trendMinTicks)) {
+      const need = Number(s.trendMinTicks);
+      if (worstCaseTicks < need) {
         warnings.push(`a ${trendSec}s index bar holds at most ${worstCaseTicks} samples on the `
           + `REST quote fallback (NEO_POLL_MS=${config.neo.pollMs}), under trendMinTicks `
-          + `(${s.trendMinTicks}) — on a quiet tape every bar will read as NO_DATA and no `
+          + `(${need}) — on a quiet tape every bar will read as NO_DATA and no `
           + 'entry will be allowed. Lower trendMinTicks or confirm the market socket is streaming.');
+      } else if (need > 0 && worstCaseTicks - need <= 1) {
+        // The ceiling is not the expectation. `worstCaseTicks` assumes a fresh
+        // price on EVERY poll, and the ticker deliberately suppresses a repeat
+        // of the same price inside one interval — so a quiet five seconds
+        // yields fewer than five samples, and a bar boundary that falls between
+        // polls costs another. With a margin this thin the filter blocks on
+        // ordinary quiet, not on genuinely thin data, and it does so silently.
+        warnings.push(`trendMinTicks (${need}) leaves almost no margin: a ${trendSec}s bar holds `
+          + `at most ${worstCaseTicks} samples at NEO_POLL_MS=${config.neo.pollMs}, and the `
+          + 'ticker suppresses an unchanged price inside one interval — so a quiet bar will '
+          + `fall under ${need} and read NO_DATA. Either lower trendMinTicks to `
+          + `${Math.max(1, worstCaseTicks - 2)} or widen trendTimeframe.`);
       }
     }
 

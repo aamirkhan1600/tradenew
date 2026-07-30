@@ -113,8 +113,41 @@ Browser ──REST + Socket.IO──► Express app (src/app.js, :4100)
 `start` / `stop` / `pause` and settings; it never touches a trading endpoint. So
 "how many things can place an order?" is answerable by reading one file.
 
+**The engine opens no cycle until the intent flag says `RUN`.** Start / Stop /
+Pause write `engine_intent`; the engine reads it on every clock. An unset or
+unrecognised value means STOP, which is what the dashboard already displays for
+one — so a freshly migrated install trades nothing until Start is pressed. STOP
+and PAUSE both block new entries and **neither abandons an open position**:
+timeouts, targets, stops and the square-off keep running, because walking away
+from a live naked short is not a risk control.
+
 A DB-backed leader lock means a second engine refuses to start rather than
 doubling every order.
+
+The web tier reaches the broker in exactly two places, both read-or-login and
+neither able to reach an order: the interactive TOTP login, and the market
+terminal's quote feed (below).
+
+### The market terminal
+
+`/terminal` is a read-only NIFTY index chart, live option chain and option
+premium chart — the three modules of `doc/index-option-chaine.md`. It is lazy:
+its market-data socket and its one-second chain poll start when a browser opens
+the page and stop about 45 seconds after the last one closes, because they spend
+the same per-account Kotak rate limit the engine's order path needs.
+
+Two things about it are worth knowing before reading a number off it, and both
+are covered properly in **`doc/terminal.md`**:
+
+- **Every greek and every IV is modelled from the last traded price.** Kotak
+  sends none. On a stale far strike they describe whenever that strike last
+  traded.
+- **"Volume" is a tick count.** Kotak's quote feed carries no traded quantity on
+  this account class, so the histogram counts price updates per bar. Anything the
+  broker genuinely does not send renders as `—`, never as `0`.
+
+There is also no historical-candles endpoint at Kotak, so the charts start empty
+on a fresh install and fill in as the terminal runs.
 
 ### Where the interesting code is
 
@@ -126,6 +159,9 @@ doubling every order.
 | `src/execution/orderRouter.js` | idempotency and the three-way failure rule |
 | `src/execution/reconciler.js` | fills, UNKNOWN resolution, boot recovery |
 | `src/core/money.js` | integer paise, charges, net P&L |
+| `src/market/terminalFeed.js` | the terminal's lazy quote feed — read-only, viewer-counted |
+| `src/market/greeks.js` | Black-Scholes: the greeks Kotak does not send |
+| `src/shared/indicators.js` | one indicator implementation, run by both the server and the browser |
 
 ### Four decisions inside the candle builder
 
@@ -175,7 +211,7 @@ one seen. Paper results should still be read as an optimistic bound.
 ## Testing
 
 ```bash
-npm test        # 94 tests, no database, no broker, ~0.5s
+npm test        # 235 tests, no database, no broker, ~1s
 ```
 
 Three invariants get dedicated tests because a violation costs money:
@@ -183,6 +219,13 @@ Three invariants get dedicated tests because a violation costs money:
 - **I1** — no order is priced from a quote, tick, ask, bid or LTP.
 - **I2** — a leg never has two working SELL orders.
 - **I3** — no exit market order is sent while a target is still working.
+
+The terminal's maths is tested against things that can be looked up rather than
+against itself: the greeks against the textbook reference set and put-call
+parity, the indicators against properties (an EMA of a constant is that constant,
+an RSI of an unbroken advance is 100), and the chain analytics against the
+zero-versus-unknown rule that keeps a missing broker field from rendering as a
+real number.
 
 The charge schedule is pinned in `test/helpers.js` rather than read from `.env`,
 so the suite tests the model rather than whichever brokerage plan the operator
@@ -193,7 +236,28 @@ is on.
 ```bash
 node scripts/sync-instruments.js   # sync the master, print expiries and the chain
 node scripts/diagnose-master.js    # probe Kotak's scrip-master endpoint variants
+node scripts/diagnose-spot.js      # why the terminal has no index price
+node scripts/diagnose-engine.js    # why the scalper is not trading (the DB-side gates)
+node scripts/dry-run.js            # walk the entry path with live quotes, open nothing
+npm run backfill                   # download index history from Yahoo into candles
+npm run backtest -- NIFTY 5m 60    # replay the trend filter over stored history
 ```
+
+### History and backtesting
+
+Kotak has no historical-candles endpoint, so `npm run backfill` imports index
+history from Yahoo Finance — 1m for a week, 5m/15m/1h for two months, daily for
+a decade. That fills the terminal's index chart and makes the index trend filter
+replayable.
+
+**Yahoo carries no NSE option data at all** — verified against the live API, not
+assumed. Your entry price comes from the option contract's own closed candle, so
+entries, targets, stops and P&L cannot be backtested from it at any price.
+Option premium history accumulates only while `npm run engine` or the terminal
+is running. `npm run backtest` replays the real trend filter over index history
+and reports honestly which of the two it had. Full detail, including a real
+finding about the volatility ceiling not surviving a timeframe change, is in
+**`doc/history.md`**.
 
 ---
 
@@ -220,3 +284,10 @@ before anything else.
   is built from roughly 15 samples and its high and low are understated.
 - Single account, single instrument. Multi-account and the other three indices
   are carried in the instrument master but not wired up.
+- Kotak's Trade API has no historical-candles endpoint. `npm run backfill`
+  imports INDEX history from Yahoo to cover that; option premiums have no such
+  source and accumulate only while this platform is running, which is also the
+  hard limit on what can be backtested. See `doc/history.md`.
+- The terminal's greeks, IV and "volume" are modelled or proxied rather than
+  quoted, because the broker sends none of them. `doc/terminal.md` §2 is the
+  section to read before acting on those columns.

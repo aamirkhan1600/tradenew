@@ -5,5 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title><%= typeof title !== 'undefined' ? title : 'zoption' %></title>
   <link rel="stylesheet" href="/static/app.css">
+  <% for (const sheet of (typeof styles !== 'undefined' ? styles : [])) { %>
+  <link rel="stylesheet" href="<%= sheet %>">
+  <% } %>
+  <script>
+    // Before first paint, so a light-theme user does not get a dark flash on
+    // every navigation. The terminal's toggle writes this key.
+    try {
+      document.documentElement.setAttribute('data-theme',
+        localStorage.getItem('zoption.theme') === 'light' ? 'light' : 'dark');
+    } catch (e) { /* private mode */ }
+  </script>
 </head>
 <body>

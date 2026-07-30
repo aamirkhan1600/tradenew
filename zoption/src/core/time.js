@@ -29,6 +29,20 @@ const TIMEFRAMES = {
   '5m': 300,
 };
 
+// The CHART timeframes are a strict superset, and deliberately a SEPARATE map.
+//
+// `TIMEFRAMES` is the set the strategy may be configured with, and it stops at
+// 5m for a reason: an entry priced off an hourly close is a different strategy.
+// The terminal reads the market rather than trading it, so it wants the long end
+// too — but adding 1h to `TIMEFRAMES` would silently make `candleTimeframe: 1h`
+// a legal engine configuration. Two maps, two questions.
+const CHART_TIMEFRAMES = {
+  ...TIMEFRAMES,
+  '15m': 900,
+  '1h': 3600,
+  '1d': 86400,
+};
+
 function timeframeSeconds(tf) {
   const s = TIMEFRAMES[String(tf || '').toLowerCase()];
   if (!s) throw new Error(`unsupported candle timeframe "${tf}" — one of ${Object.keys(TIMEFRAMES).join(', ')}`);
@@ -37,6 +51,33 @@ function timeframeSeconds(tf) {
 
 function isTimeframe(tf) {
   return Object.prototype.hasOwnProperty.call(TIMEFRAMES, String(tf || '').toLowerCase());
+}
+
+function chartTimeframeSeconds(tf) {
+  const s = CHART_TIMEFRAMES[String(tf || '').toLowerCase()];
+  if (!s) {
+    throw new Error(`unsupported chart timeframe "${tf}" — one of ${Object.keys(CHART_TIMEFRAMES).join(', ')}`);
+  }
+  return s;
+}
+
+function isChartTimeframe(tf) {
+  return Object.prototype.hasOwnProperty.call(CHART_TIMEFRAMES, String(tf || '').toLowerCase());
+}
+
+// The widest STORED timeframe that divides `tf` exactly, so a chart bar can be
+// rebuilt from stored bars without straddling a boundary. Returns null when the
+// requested timeframe is itself a base, or when no base divides it.
+function baseTimeframeFor(tf, bases = ['1m', '5s']) {
+  const want = chartTimeframeSeconds(tf);
+  let best = null;
+  for (const b of bases) {
+    const sec = chartTimeframeSeconds(b);
+    if (sec >= want) continue;
+    if (want % sec !== 0) continue;
+    if (!best || sec > chartTimeframeSeconds(best)) best = b;
+  }
+  return best;
 }
 
 /* ------------------------------------------------------------ IST pieces -- */
@@ -145,8 +186,8 @@ function fromMysql(value) {
 }
 
 module.exports = {
-  IST_OFFSET_MS, TIMEFRAMES,
-  timeframeSeconds, isTimeframe,
+  IST_OFFSET_MS, TIMEFRAMES, CHART_TIMEFRAMES,
+  timeframeSeconds, isTimeframe, chartTimeframeSeconds, isChartTimeframe, baseTimeframeFor,
   istParts, tradeDate, istClock, parseHhMm, secondsIntoIstDay, atIstTime,
   bucketStart, bucketEnd, bucketLabel,
   isWithinSession, isAfter,

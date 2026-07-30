@@ -381,15 +381,47 @@ async function syncAll(session) {
   return { options, indices, pruned };
 }
 
-// The spot instrument as { token, segment }. Falls back to quoting the index by
-// NAME — the quotes API accepts `nse_cm|Nifty 50` as readily as a numeric token
-// — so a first run is not blind before the cash master has synced.
+// The spot instrument, addressed the way the QUOTES API will actually answer.
+//
+// AN INDEX IS QUOTED BY NAME, NOT BY ITS TOKEN. This is not a preference or a
+// fallback — it is the only addressing that works, verified against the live
+// gateway:
+//
+//     nse_cm|26000       -> HTTP 200, and an EMPTY array
+//     nse_cm|Nifty 50    -> HTTP 200, {"exchange_token":"Nifty 50","ltp":"24317.15"}
+//     nse_fo|65867       -> HTTP 200, {"exchange_token":"65867","ltp":"23.20"}   (options are fine by token)
+//
+// The empty array is what makes this so hard to see. The gateway does not
+// refuse, it does not error, it answers successfully with nothing — so every
+// layer above reports "no price for this instrument" and none of them is wrong.
+//
+// This function used to prefer the stored numeric token and treat the name as a
+// degraded fallback for an unsynced master. It had it exactly backwards: once
+// the cash master synced, the index became UNQUOTABLE, and with it went the
+// spot price, the ATM, the trend filter's entire bar series and therefore every
+// entry the engine could ever make.
+//
+// The numeric token is still returned as `exchangeToken` because the binary
+// WebSocket feed addresses instruments that way — the two transports genuinely
+// disagree, and only the REST path is proven to work on this account class.
 async function indexInstrument(underlying) {
   const key = String(underlying).toUpperCase();
   const stored = await repo.instruments.indexInstrument(key);
-  if (stored?.token) return stored;
   const meta = INDEX[key];
-  return meta ? { token: meta.quoteSymbol, segment: meta.segment, byName: true } : null;
+
+  if (meta) {
+    return {
+      token: meta.quoteSymbol,               // what the quotes API answers to
+      segment: meta.segment,
+      symbol: stored?.symbol || meta.quoteSymbol,
+      exchangeToken: stored?.token || null,  // what the binary socket answers to
+      quoteBy: 'name',
+    };
+  }
+  // An underlying this file carries no name for. The stored token is all there
+  // is, and it may well answer with nothing — but guessing a name would be
+  // worse than trying what the master published.
+  return stored?.token ? { ...stored, quoteBy: 'token' } : null;
 }
 
 module.exports = {

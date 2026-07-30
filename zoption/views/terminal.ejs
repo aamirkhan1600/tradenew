@@ -1,0 +1,191 @@
+<%- include('partials/head', { title: 'zoption — terminal', styles: ['/static/terminal.css'] }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<!--
+  The layout from doc/index-option-chaine.md §UI Layout:
+
+    HEADER   broker · market status · spot · expiry · search
+    LEFT 70% NIFTY index chart          RIGHT 30% market summary
+    BOTTOM   option chain
+    BOTTOM   option premium chart
+
+  Everything on this page is READ-ONLY. There is no control that reaches the
+  engine and no path from here to an order.
+-->
+
+<!-- Server configuration reaches the client as data attributes rather than an
+     inline script: the CSP tolerates inline script, but a page that carries its
+     configuration in the DOM is one that can be read with view-source. -->
+<main class="terminal"
+      data-symbol="<%= defaults.underlying %>"
+      data-range="<%= defaults.range %>"
+      data-max-range="<%= defaults.maxRange %>"
+      data-timeframes="<%= defaults.timeframes.join(',') %>">
+
+  <header class="tbar">
+    <div class="tbar-l">
+      <span class="sym">NIFTY</span>
+      <span id="ix-price" class="v big">—</span>
+      <span id="spot-source" class="pill hidden"></span>
+      <span id="ix-change" class="sub">—</span>
+    </div>
+    <div class="tbar-c">
+      <label class="inline">Expiry <select id="expiry"></select></label>
+      <span id="range" class="segbar"></span>
+      <input id="search" class="search" type="search" placeholder="strike, e.g. 24500PE"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tbar-r">
+      <span id="paused" class="pill hidden"></span>
+      <span id="market" class="pill">—</span>
+      <span id="feed" class="pill">—</span>
+      <span id="clock" class="mono"></span>
+      <button id="theme" type="button" class="seg ghost" title="light / dark">◐</button>
+    </div>
+  </header>
+
+  <p id="coverage" class="coverage"></p>
+
+  <!-- ------------------------------------------------- module 1 + summary -->
+  <section class="row-main">
+
+    <div class="pane pane-index">
+      <div class="pane-h">
+        <h2>NIFTY index</h2>
+        <span id="tf-index" class="segbar"></span>
+        <span id="type-index" class="segbar"></span>
+        <details class="drop">
+          <summary>Indicators</summary>
+          <div id="ind-index" class="chks"></div>
+        </details>
+        <details class="drop">
+          <summary>Draw</summary>
+          <div id="tools" class="segbar wrap"></div>
+        </details>
+      </div>
+      <div id="legend-index" class="legend"></div>
+      <div id="chart-index" class="chart tall"></div>
+      <p class="hint">
+        <b>+</b> zoom in · <b>−</b> zoom out · <b>R</b> reset · <b>Space</b> pause the live bar ·
+        <b>Esc</b> cancel a drawing · <b>Del</b> remove the last drawing
+      </p>
+    </div>
+
+    <aside class="pane pane-summary">
+      <div class="pane-h"><h2>Market summary</h2></div>
+
+      <div class="tiles">
+        <div class="tile"><span class="k">Spot</span><b id="sm-spot" class="v">—</b></div>
+        <div class="tile"><span class="k">ATM</span><b id="sm-atm" class="v">—</b></div>
+        <div class="tile"><span class="k">PCR</span><b id="sm-pcr" class="v">—</b></div>
+        <div class="tile"><span class="k">Max pain</span><b id="sm-maxpain" class="v">—</b></div>
+        <div class="tile"><span class="k">India VIX</span><b id="sm-vix" class="v">—</b></div>
+        <div class="tile"><span class="k">Lot size</span><b id="sm-lot" class="v">—</b></div>
+        <div class="tile"><span class="k">Total call OI</span><b id="sm-calloi" class="v">—</b></div>
+        <div class="tile"><span class="k">Total put OI</span><b id="sm-putoi" class="v">—</b></div>
+        <div class="tile"><span class="k">Net OI</span><b id="sm-netoi" class="v">—</b></div>
+        <div class="tile"><span class="k">Expiry</span><b id="sm-expiry" class="v">—</b></div>
+      </div>
+
+      <h3>Index</h3>
+      <dl class="kv2">
+        <dt>Open</dt><dd id="ix-open">—</dd>
+        <dt>High</dt><dd id="ix-high">—</dd>
+        <dt>Low</dt><dd id="ix-low">—</dd>
+        <dt>Previous close</dt><dd id="ix-prev">—</dd>
+        <dt>Day range</dt><dd id="ix-range">—</dd>
+        <dt>VWAP</dt><dd id="ix-vwap">—</dd>
+        <dt>Bar activity</dt><dd id="ix-ticks">—</dd>
+        <dt>SuperTrend</dt><dd id="ix-trend">—</dd>
+      </dl>
+    </aside>
+  </section>
+
+  <!-- ------------------------------------------------------------ module 2 -->
+  <section class="pane pane-chain">
+    <div class="pane-h">
+      <h2>Option chain <small>refreshes every second</small></h2>
+      <span id="chain-sort" class="segbar"></span>
+      <details class="drop">
+        <summary>Columns</summary>
+        <div id="chain-groups" class="chks"></div>
+      </details>
+      <details class="drop">
+        <summary>Filters</summary>
+        <div id="chain-filters" class="chks">
+          <label class="chk"><input type="checkbox" data-filter="hideZeroVolume"> Hide zero volume</label>
+          <label class="chk"><input type="checkbox" data-filter="hideDeepOtm"> Hide deep OTM</label>
+          <label class="chk">Moneyness
+            <select data-filter="moneyness">
+              <option value="ALL">All</option>
+              <option value="ATM">Only ATM</option>
+              <option value="ITM">Only ITM</option>
+              <option value="OTM">Only OTM</option>
+            </select>
+          </label>
+          <label class="chk">Minimum OI <input type="number" data-filter="minOi" min="0" step="1000"></label>
+          <label class="chk">Minimum volume <input type="number" data-filter="minVolume" min="0" step="100"></label>
+        </div>
+      </details>
+    </div>
+    <div id="chain" class="chain-host"><p class="muted pad">Waiting for the option chain…</p></div>
+    <p class="hint">
+      Click a call or a put to chart it below.
+      <span class="swatch heat-call"></span> largest call OI ·
+      <span class="swatch heat-put"></span> largest put OI ·
+      <span class="swatch atm-cell"></span> at the money ·
+      <span class="swatch heat-vol"></span> most traded ·
+      <span class="swatch spike"></span> volume spike
+    </p>
+  </section>
+
+  <!-- ------------------------------------------------------------ module 3 -->
+  <section class="pane pane-premium">
+    <div class="pane-h">
+      <h2>Option premium <small id="pm-title">—</small></h2>
+      <span id="pm-position" class="pill"></span>
+      <span id="tf-premium" class="segbar"></span>
+      <span id="type-premium" class="segbar"></span>
+      <details class="drop">
+        <summary>Indicators</summary>
+        <div id="ind-premium" class="chks"></div>
+      </details>
+    </div>
+
+    <p id="premium-empty" class="muted pad">
+      No contract selected. Click a premium in the chain above, or type a strike in the search box.
+    </p>
+
+    <div id="premium-live" class="premium-grid hidden">
+      <div class="premium-chart">
+        <div id="legend-premium" class="legend"></div>
+        <div id="chart-premium" class="chart"></div>
+      </div>
+      <div class="premium-side">
+        <details class="card-d" open><summary>Contract</summary><div id="pm-info"></div></details>
+        <details class="card-d" open><summary>Greeks</summary><div id="pm-greeks"></div></details>
+        <details class="card-d" open><summary>Premium statistics</summary><div id="pm-stats"></div></details>
+        <details class="card-d"><summary>Volume analysis</summary><div id="pm-volume"></div></details>
+        <details class="card-d"><summary>Candle patterns</summary><div id="pm-patterns"></div></details>
+        <details class="card-d"><summary>Alerts</summary><div id="pm-alerts"></div></details>
+      </div>
+    </div>
+  </section>
+
+  <div id="toasts" class="toasts"></div>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+<!-- One implementation of every indicator, shared with the server — see the
+     header of src/shared/indicators.js. -->
+<script src="/static/shared/indicators.js"></script>
+<script src="/static/shared/patterns.js"></script>
+<script src="/static/terminal/core.js"></script>
+<script src="/static/terminal/drawings.js"></script>
+<script src="/static/terminal/chart.js"></script>
+<script src="/static/terminal/chain.js"></script>
+<script src="/static/terminal/premium.js"></script>
+<script src="/static/terminal/app.js"></script>
+
+<%- include('partials/foot') %>

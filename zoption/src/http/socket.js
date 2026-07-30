@@ -13,9 +13,16 @@ const config = require('../config');
 const logger = require('../core/logger');
 const time = require('../core/time');
 const repo = require('../repositories');
+const terminal = require('../market/terminal');
 const auth = require('./middleware/auth');
 
 const PUSH_MS = 1000;
+
+// The terminal's own room. Its traffic is a tick stream and a 40-row table once
+// a second — pushing that to a dashboard tab that is not showing a chart would
+// be pure waste, so a client opts in by joining and the feed only runs while
+// somebody is in here.
+const TERMINAL_ROOM = 'terminal';
 
 function parseCookies(header) {
   const out = {};
@@ -43,10 +50,69 @@ function attach(httpServer) {
     }
   });
 
+  attachTerminal(io);
+
   io.on('connection', (socket) => {
     logger.debug('socket: connected', { id: socket.id });
     push(io).catch(() => {});          // do not make a fresh tab wait a second
-    socket.on('disconnect', () => logger.debug('socket: disconnected', { id: socket.id }));
+
+    // --- terminal ---------------------------------------------------------
+    // Joining starts the feed if it is not already running; leaving (or closing
+    // the tab) releases it. Every handler answers on `terminal_error` rather
+    // than throwing, because a rejected subscribe must leave the page usable
+    // and saying why.
+    socket.on('terminal:join', async (req = {}, ack) => {
+      socket.join(TERMINAL_ROOM);
+      try {
+        const ok = await terminal.ensure({
+          viewer: socket.id,
+          underlying: req.symbol || undefined,
+          expiry: req.expiry || null,
+          range: req.range || undefined,
+          timeoutMs: 6000,
+        });
+        socket.emit('terminal_status', terminal.status());
+        if (ok) socket.emit('option_chain_update', terminal.buildChain());
+        if (typeof ack === 'function') ack({ ok, status: terminal.status() });
+      } catch (err) {
+        socket.emit('terminal_error', { message: err.message });
+        if (typeof ack === 'function') ack({ ok: false, error: err.message });
+      }
+    });
+
+    socket.on('terminal:chain', async (req = {}, ack) => {
+      try {
+        await terminal.setChain({
+          underlying: req.symbol || undefined,
+          expiry: req.expiry || null,
+          range: req.range || undefined,
+        });
+        socket.emit('terminal_status', terminal.status());
+        if (typeof ack === 'function') ack({ ok: true });
+      } catch (err) {
+        socket.emit('terminal_error', { message: err.message });
+        if (typeof ack === 'function') ack({ ok: false, error: err.message });
+      }
+    });
+
+    // Module 3 follows one contract at a time. Passing null detaches it, which
+    // is what closing the premium chart should do — otherwise a session spent
+    // clicking through strikes ends up subscribed to all of them.
+    socket.on('terminal:option', (req = {}) => {
+      try { terminal.setOption(req.token || null); } catch (err) {
+        socket.emit('terminal_error', { message: err.message });
+      }
+    });
+
+    socket.on('terminal:leave', () => {
+      socket.leave(TERMINAL_ROOM);
+      terminal.removeViewer(socket.id);
+    });
+
+    socket.on('disconnect', () => {
+      logger.debug('socket: disconnected', { id: socket.id });
+      terminal.removeViewer(socket.id);
+    });
   });
 
   let lastEventId = 0;
@@ -65,8 +131,32 @@ function attach(httpServer) {
 
   return {
     io,
-    close() { running = false; io.close(); },
+    close() {
+      running = false;
+      // The feed holds a market-data socket and a poll timer; leaving it up
+      // after the HTTP server has gone would keep the process alive and keep
+      // spending the account's rate limit on a terminal nobody can see.
+      try { terminal.stop(); } catch (_) { /* already stopped */ }
+      io.close();
+    },
   };
+}
+
+// Wire the feed's events into the room. Bound ONCE per server rather than per
+// connection: a listener added on every connect would fan a single tick out
+// once per open tab and leak a listener on every reload.
+function attachTerminal(io) {
+  const room = () => io.to(TERMINAL_ROOM);
+  terminal.on('index_tick', (t) => room().emit('index_tick', t));
+  terminal.on('option_tick', (t) => room().emit('option_tick', t));
+  terminal.on('option_chain_update', (c) => room().emit('option_chain_update', c));
+  terminal.on('status', (s) => room().emit('terminal_status', s));
+  // The feed is an EventEmitter with no error listener by default, and an
+  // unhandled 'error' would take the web process down with it.
+  terminal.on('error', (err) => {
+    logger.warn('terminalFeed: error', { err: err?.message });
+    room().emit('terminal_error', { message: err?.message || 'market data error' });
+  });
 }
 
 async function push(io, sinceEventId = 0) {

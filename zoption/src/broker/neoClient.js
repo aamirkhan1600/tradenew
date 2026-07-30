@@ -310,6 +310,116 @@ function readQuoteRow(row) {
   return { ltp: Number.isFinite(ltp) && ltp > 0 ? ltp : null, ids };
 }
 
+/* ---------------------------------------------------- rich quote fields --- */
+
+// The option chain wants OI, volume, bid, ask and the day's OHLC. Whether any of
+// them arrive depends on the account's entitlement and on which quote filter the
+// gateway honours, and Kotak spells each field several ways across filters and
+// segments. So every field is looked up under every spelling that has been
+// observed, and ANYTHING NOT FOUND IS null — never 0.
+//
+// That distinction is the whole point of this function. An option chain that
+// prints 0 in the OI column looks like a strike nobody holds; one that prints an
+// em-dash looks like a column the broker did not send. The first is a lie a
+// trader can act on.
+const QUOTE_KEYS = {
+  ltp: ['ltp', 'LTP', 'lp', 'last_price', 'last_traded_price', 'lastPrice'],
+  open: ['open', 'op', 'openPrice', 'o', 'dayOpen'],
+  high: ['high', 'h', 'hp', 'highPrice', 'dayHigh'],
+  low: ['low', 'l', 'lo', 'lowPrice', 'dayLow'],
+  close: ['close', 'c', 'cp', 'prevClose', 'previousClose', 'closePrice', 'pc'],
+  volume: ['volume', 'v', 'vol', 'volumeTraded', 'tradedVolume', 'totalTradedVolume', 'ttv', 'vtt'],
+  oi: ['oi', 'OI', 'openInterest', 'open_interest', 'opnInterest', 'oiCur'],
+  // Kotak reports a previous-day open interest under its own set of names. The
+  // chain's "OI change" is this subtracted from `oi`; where it is missing the
+  // change is null rather than equal to the OI itself.
+  prevOi: ['prevOi', 'previousOi', 'oiPrev', 'prev_open_interest', 'poi'],
+  bid: ['bid', 'bp', 'bidPrice', 'bestBid', 'bp1', 'buyPrice'],
+  ask: ['ask', 'sp', 'askPrice', 'bestAsk', 'sp1', 'sellPrice', 'offerPrice'],
+  bidQty: ['bidQty', 'bq', 'bq1', 'bidQuantity', 'buyQty'],
+  askQty: ['askQty', 'sq', 'sq1', 'askQuantity', 'sellQty'],
+};
+
+function firstNumber(row, keys) {
+  for (const k of keys) {
+    if (row[k] === undefined || row[k] === null || row[k] === '') continue;
+    const n = Number(row[k]);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+// Kotak's richer filters NEST their payload instead of flattening it:
+//
+//   ltp   -> { exchange_token, ltp }
+//   ohlc  -> { exchange_token, ohlc: { open, high, low, close } }
+//   depth -> { exchange_token, depth: { buy: [{price, quantity, orders} …],
+//                                       sell: [ … ] } }
+//
+// and each filter returns ONLY its own block — there is no combined response.
+// Read flat-only, an `ohlc` row looks like a row with nothing in it, which is
+// how a filter that works gets classified as one that does not.
+function flatten(row) {
+  const flat = { ...row };
+  const ohlc = row.ohlc;
+  if (ohlc && typeof ohlc === 'object') {
+    for (const k of ['open', 'high', 'low', 'close']) {
+      if (flat[k] === undefined && ohlc[k] !== undefined) flat[k] = ohlc[k];
+    }
+  }
+  const depth = row.depth;
+  if (depth && typeof depth === 'object') {
+    // The best bid and offer are the FIRST rung of each ladder. The rest of the
+    // book is not carried: nothing in this platform trades off level two.
+    const bid = Array.isArray(depth.buy) ? depth.buy[0] : null;
+    const ask = Array.isArray(depth.sell) ? depth.sell[0] : null;
+    if (bid) {
+      if (flat.bid === undefined) flat.bid = bid.price;
+      if (flat.bidQty === undefined) flat.bidQty = bid.quantity;
+    }
+    if (ask) {
+      if (flat.ask === undefined) flat.ask = ask.price;
+      if (flat.askQty === undefined) flat.askQty = ask.quantity;
+    }
+  }
+  return flat;
+}
+
+function readQuoteFull(raw) {
+  if (!raw || typeof raw !== 'object') return { ids: [] };
+  const row = flatten(raw);
+  const out = { ids: readQuoteRow(row).ids };
+  for (const [field, keys] of Object.entries(QUOTE_KEYS)) {
+    out[field] = firstNumber(row, keys);
+  }
+  // A price of 0 means "no trade yet", which is absent rather than free.
+  for (const field of ['ltp', 'open', 'high', 'low', 'close', 'bid', 'ask']) {
+    if (out[field] !== null && out[field] <= 0) out[field] = null;
+  }
+  // Open interest and volume of exactly 0 ARE meaningful — a strike can
+  // legitimately have neither — so they are left as they came.
+  out.oiChange = (out.oi !== null && out.prevOi !== null) ? out.oi - out.prevOi : null;
+  return out;
+}
+
+// Which of the interesting fields a batch of rows actually carried. The terminal
+// reports this to the browser so a column the broker never sends is labelled
+// unavailable once, at the top, rather than as a table full of dashes the
+// operator has to interpret.
+function quoteCoverage(rows) {
+  const fields = ['ltp', 'open', 'high', 'low', 'close', 'volume', 'oi', 'oiChange', 'bid', 'ask'];
+  const seen = {};
+  for (const f of fields) seen[f] = 0;
+  for (const raw of rows || []) {
+    const q = readQuoteFull(raw);
+    for (const f of fields) if (q[f] !== null && q[f] !== undefined) seen[f] += 1;
+  }
+  const total = (rows || []).length;
+  const available = {};
+  for (const f of fields) available[f] = total > 0 && seen[f] > 0;
+  return { total, counts: seen, available };
+}
+
 /* ------------------------------------------------------- order-book shape - */
 
 // Kotak's order book uses short, inconsistent keys and spells the status in
@@ -357,6 +467,6 @@ function readOrderBook(response) {
 module.exports = {
   tradeApiLogin, tradeApiValidate,
   placeOrder, cancelOrder, orderBook, orderHistory, positions, checkMargin,
-  quotes, readQuoteRow,
-  normaliseBookRow, readOrderBook,
+  quotes, readQuoteRow, readQuoteFull, quoteCoverage, QUOTE_KEYS,
+  normaliseBookRow, readOrderBook, flattenQuoteRow: flatten,
 };

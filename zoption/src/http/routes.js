@@ -18,6 +18,10 @@ const repo = require('../repositories');
 const db = require('../core/db');
 const session = require('../broker/neoSession');
 const instrumentMaster = require('../market/instrumentMaster');
+const history = require('../market/history');
+const terminal = require('../market/terminal');
+const yahoo = require('../market/yahoo');
+const backfill = require('../market/backfill');
 const settingsService = require('../strategy/settings');
 const auth = require('./middleware/auth');
 const { ValidationError } = require('../core/errors');
@@ -87,6 +91,21 @@ router.get('/trades', auth.requirePage, wrap(async (req, res) => {
 router.get('/events', auth.requirePage, wrap(async (req, res) => {
   const events = await repo.events.recent(300);
   res.render('events', { page: 'events', events });
+}));
+
+// The read-only market terminal — doc/index-option-chaine.md. It reads quotes
+// and draws them; it has no control over the engine and no path to an order.
+router.get('/terminal', auth.requirePage, wrap(async (req, res) => {
+  res.render('terminal', {
+    page: 'terminal',
+    defaults: {
+      underlying: 'NIFTY',
+      range: config.terminal.defaultRange,
+      maxRange: config.terminal.maxRange,
+      chainRefreshMs: config.terminal.chainRefreshMs,
+      timeframes: Object.keys(time.CHART_TIMEFRAMES),
+    },
+  });
 }));
 
 /* -------------------------------------------------------------------- API -- */
@@ -275,6 +294,172 @@ api.get('/candles', wrap(async (req, res) => {
   res.json({ ok: true, candles: await repo.candles.recent(token, timeframe, limit) });
 }));
 
+// --- terminal --------------------------------------------------------------
+// The three modules of doc/index-option-chaine.md. Every one of these is a
+// READ: the terminal has no write path, and the layering rule that keeps broker
+// mutation out of the web tier is untouched by it.
+
+// Resolve what a caller means by "symbol" to the one token the feed can quote.
+// A bare token is accepted too, so a chart can be pointed at any contract the
+// instrument master knows without the caller having to spell out the contract.
+async function resolveChartToken(query) {
+  if (query.token) return { token: String(query.token), label: String(query.token) };
+
+  const symbol = String(query.symbol || 'NIFTY').toUpperCase();
+  const type = query.type ? String(query.type).toUpperCase() : null;
+
+  if (!type || type === 'IDX' || type === 'INDEX') {
+    const idx = await instrumentMaster.indexInstrument(symbol);
+    if (!idx?.token) {
+      throw new ValidationError(`no index instrument for ${symbol} — sync the instrument master`);
+    }
+    // An index is addressed by NAME, which is also the key its candles are
+    // stored under — see instrumentMaster.indexInstrument. There is nothing
+    // degraded about that and nothing to refuse.
+    return { token: String(idx.token), label: symbol };
+  }
+
+  if (type !== 'CE' && type !== 'PE') throw new ValidationError('type must be CE, PE or IDX');
+  const expiry = String(query.expiry || '').slice(0, 10);
+  const strike = Number(query.strike);
+  if (!expiry) throw new ValidationError('expiry is required for an option chart');
+  if (!Number.isFinite(strike)) throw new ValidationError('strike is required for an option chart');
+
+  const chain = await repo.instruments.chain(symbol, expiry);
+  const row = chain.find(r => Number(r.strike) === strike && r.option_type === type);
+  if (!row) throw new ValidationError(`no ${symbol} ${strike} ${type} for ${expiry} in the master`);
+  return { token: String(row.token), label: row.symbol, instrument: row };
+}
+
+// Bars leave here in RUPEES and in SECONDS, which is what a chart library reads.
+// Paise and milliseconds are an internal convention and converting at the edge
+// means exactly one place can get it wrong.
+const toChartBar = (b) => ({
+  time: Math.floor(b.time / 1000),
+  open: b.openP / 100,
+  high: b.highP / 100,
+  low: b.lowP / 100,
+  close: b.closeP / 100,
+  volume: b.tickCount,
+  synthetic: b.synthetic,
+});
+
+async function chartHistory(req, res) {
+  const timeframe = String(req.query.timeframe || '1m').toLowerCase();
+  if (!time.isChartTimeframe(timeframe)) {
+    throw new ValidationError(
+      `timeframe must be one of ${Object.keys(time.CHART_TIMEFRAMES).join(', ')}`);
+  }
+  const limit = Math.min(5000, Math.max(1, Number(req.query.limit) || 500));
+  const from = req.query.from ? Number(req.query.from) : null;
+  const to = req.query.to ? Number(req.query.to) : null;
+  if ((from !== null && !Number.isFinite(from)) || (to !== null && !Number.isFinite(to))) {
+    throw new ValidationError('from and to must be epoch milliseconds');
+  }
+
+  const target = await resolveChartToken(req.query);
+  const bars = await history.series(target.token, timeframe, { from, to, limit });
+
+  res.json({
+    ok: true,
+    token: target.token,
+    symbol: target.label,
+    timeframe,
+    candles: bars.map(toChartBar),
+    // Said out loud on every response, because an empty chart on a fresh
+    // install is the single most confusing thing about this terminal and the
+    // reason is not guessable: there is no history endpoint to backfill from.
+    note: bars.length ? undefined
+      : 'no stored bars yet — Kotak\'s Trade API has no historical-candles endpoint, '
+        + 'so this series is recorded live and fills in while the terminal is open',
+  });
+}
+
+api.get('/chart/history', wrap(chartHistory));
+api.get('/option/chart/history', wrap(chartHistory));
+
+api.get('/options/expiries', wrap(async (req, res) => {
+  const symbol = String(req.query.symbol || 'NIFTY').toUpperCase();
+  res.json({ ok: true, symbol, expiries: await repo.instruments.expiries(symbol) });
+}));
+
+api.get('/options/chain', wrap(async (req, res) => {
+  const symbol = String(req.query.symbol || 'NIFTY').toUpperCase();
+  const expiry = req.query.expiry ? String(req.query.expiry).slice(0, 10) : null;
+  const range = req.query.range ? Number(req.query.range) : null;
+
+  // Starts the feed if it is not already running and waits for one real
+  // snapshot, so this endpoint answers on its own rather than only while the
+  // page is open. The caller is registered as a viewer, so the feed stops again
+  // on the normal idle timer.
+  let ready = false;
+  try {
+    ready = await terminal.ensure({
+      viewer: `http:${req.ip}`,
+      underlying: symbol,
+      expiry,
+      range: range || undefined,
+    });
+  } catch (err) {
+    // "No Kotak session" is a precondition the caller can fix, not a server
+    // fault. A 500 here would read as a bug in the terminal.
+    const wrapped = new Error(err.message);
+    wrapped.status = 412;
+    wrapped.code = 'feed_unavailable';
+    throw wrapped;
+  }
+  const payload = terminal.buildChain();
+  res.json({
+    ok: true,
+    ready,
+    ...payload,
+    status: ready ? undefined : terminal.status(),
+  });
+}));
+
+api.get('/terminal/status', wrap(async (req, res) => {
+  res.json({ ok: true, terminal: terminal.status() });
+}));
+
+// --- external history (Yahoo) ----------------------------------------------
+// doc/hisotry.md asks for these three as a standalone Express service. They are
+// mounted here instead: a second server would need its own auth, its own port
+// and its own deployment to expose data this one already has a database for.
+//
+// The endpoint paths are the ones the document specifies, under /api.
+//
+// Yahoo is the INDEX history source only — it carries no NSE option contracts
+// at all. See doc/history.md before planning a backtest on it.
+
+api.get('/quote/:symbol', wrap(async (req, res) => {
+  res.json({ ok: true, quote: await yahoo.service.getQuote(req.params.symbol) });
+}));
+
+api.get('/history/:symbol', wrap(async (req, res) => {
+  const { interval = '1d', start = null, end = null } = req.query;
+  const result = await yahoo.service.getHistoricalData(req.params.symbol, interval, start, end);
+  res.json({ ok: true, ...result });
+}));
+
+api.get('/search', wrap(async (req, res) => {
+  const query = req.query.q ?? req.query.query;
+  const limit = Math.min(25, Math.max(1, Number(req.query.limit) || 10));
+  res.json({ ok: true, results: await yahoo.service.searchStocks(query, { limit }) });
+}));
+
+// Download index history into `candles`. A POST because it writes, and it can
+// take a minute over the full plan — the CLI (scripts/backfill-history.js) is
+// the better tool for a first import.
+api.post('/history/backfill', wrap(async (req, res) => {
+  const { symbol = 'NIFTY', timeframe = null, days = null } = req.body || {};
+  const result = timeframe
+    ? await backfill.importTimeframe({
+      underlying: symbol, timeframe, days: days ? Number(days) : 30,
+    })
+    : await backfill.importAll({ underlying: symbol });
+  res.json({ ok: true, ...result });
+}));
+
 // --- broker ----------------------------------------------------------------
 
 api.post('/broker/login', wrap(async (req, res) => {
@@ -314,5 +499,10 @@ api.get('/health', wrap(async (req, res) => {
 }));
 
 router.use('/api', api);
+
+// doc/index-option-chaine.md spells module 3's endpoint without the `/api`
+// prefix every other route in this file uses. Both are served rather than
+// picking one and having the document be wrong.
+router.get('/option/chart/history', auth.requireAuth, wrap(chartHistory));
 
 module.exports = router;

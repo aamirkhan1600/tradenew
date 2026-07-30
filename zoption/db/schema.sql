@@ -158,6 +158,18 @@ CREATE TABLE IF NOT EXISTS candles (
   -- A bucket that saw no ticks at all. Its close is stale by definition, so it
   -- is recorded for continuity but never triggers an entry.
   synthetic    TINYINT(1) NOT NULL DEFAULT 0,
+  -- Where the bar came from. LIVE is assembled here from the tick stream and is
+  -- the only kind the engine may ever price an order from. BACKFILL was
+  -- downloaded from a third party (Yahoo) to give the charts history Kotak has
+  -- no endpoint for — it is a different measurement of the same market, taken
+  -- with a different clock and a different definition of a bar, and mixing the
+  -- two without being able to tell them apart would make a post-mortem
+  -- impossible.
+  --
+  -- `tick_count` is meaningless on a BACKFILL row: an exchange-aggregated bar
+  -- has no sample count. It is stored as 0 and readers must gate on `source`
+  -- rather than on tick_count when deciding whether a bar measured anything.
+  source       ENUM('LIVE','BACKFILL') NOT NULL DEFAULT 'LIVE',
   created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY uk_candle_bucket (token, timeframe, bucket_start),

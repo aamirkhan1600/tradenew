@@ -1,0 +1,277 @@
+/* The terminal.
+ *
+ * Everything here is written against the variables in app.css, so the light
+ * theme is one override block rather than a second stylesheet. The one place
+ * that cannot use them is the chart library, which needs literal colours — its
+ * copy of the palette lives in public/terminal/core.js and the two must be
+ * changed together.
+ *
+ * The density is deliberate. A chain screen is read under time pressure at
+ * arm's length, so the table is 11px with tabular figures and tight rows, and
+ * the visual budget goes on the three things that must be seen without reading:
+ * the money row, the open-interest walls, and anything the broker did not send.
+ */
+
+.terminal {
+  padding: 12px 14px 40px;
+  display: grid;
+  gap: 12px;
+  max-width: none;
+}
+
+/* ------------------------------------------------------------------ header */
+
+.tbar {
+  display: flex; align-items: center; gap: 16px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 14px;
+  position: sticky; top: 56px; z-index: 8;
+}
+.tbar-l { display: flex; align-items: baseline; gap: 10px; }
+.tbar-c { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.tbar-r { display: flex; align-items: center; gap: 8px; }
+.tbar .sym { font-weight: 700; letter-spacing: .4px; }
+.tbar .v.big { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tbar .sub { font-size: 12px; font-variant-numeric: tabular-nums; }
+/* The "why is there no price" line that replaces the change figure. Not
+   tabular, because it is a sentence. */
+.tbar .sub.warn-text {
+  color: var(--warn); font-variant-numeric: normal; max-width: 46ch; line-height: 1.3;
+}
+.inline { display: flex; align-items: center; gap: 6px; flex-direction: row; font-size: 12px; }
+.search { width: 190px; font-size: 12px; padding: 6px 9px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
+
+.pill {
+  font-size: 11px; letter-spacing: .4px; text-transform: uppercase;
+  padding: 3px 9px; border-radius: 999px; background: var(--panel-2); color: var(--muted);
+  white-space: nowrap;
+}
+.pill.ok { background: #17493a; color: #b9f0d8; }
+.pill.warn { background: #4a3c17; color: #f0dfb2; }
+.pill.bad { background: #4a1c1c; color: #f2c2c2; }
+:root[data-theme="light"] .pill.ok { background: #d8f0e4; color: #0b6b3c; }
+:root[data-theme="light"] .pill.warn { background: #fbeccd; color: #8a5200; }
+:root[data-theme="light"] .pill.bad { background: #fadad8; color: #a3201a; }
+.hidden { display: none !important; }
+
+/* The honesty banner. It says which columns the broker is actually sending
+   before an operator reads a number off one that it is not. */
+.coverage {
+  margin: 0; padding: 8px 12px; font-size: 12px; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+}
+.coverage.warn { border-color: #6d591f; background: #221e12; color: #e8d9ae; }
+:root[data-theme="light"] .coverage.warn { border-color: #e0c07a; background: #fdf6e5; color: #7a5300; }
+.coverage b { color: var(--text); }
+
+/* ------------------------------------------------------------------ panes */
+
+.row-main { display: grid; grid-template-columns: minmax(0, 7fr) minmax(280px, 3fr); gap: 12px; }
+@media (max-width: 1180px) { .row-main { grid-template-columns: minmax(0, 1fr); } }
+
+.pane {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px 12px; min-width: 0;
+}
+.pane-h {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.pane-h h2 { margin: 0; font-size: 13px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.pane-h h2 small { font-weight: 400; color: var(--muted); font-size: 11px; }
+
+.chart { position: relative; height: 340px; min-width: 0; }
+.chart.tall { height: 460px; }
+@media (max-width: 900px) { .chart, .chart.tall { height: 300px; } }
+
+/* The drawing canvas sits over the chart and only captures the mouse while a
+   tool is armed — otherwise the chart would lose its own pan and crosshair. */
+.draw-layer { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.draw-layer.armed { pointer-events: auto; cursor: crosshair; }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
+  font-size: 11.5px; color: var(--muted); min-height: 20px; padding: 0 2px 4px;
+  font-variant-numeric: tabular-nums;
+}
+.legend b { color: var(--text); font-weight: 600; }
+.legend .lg-time { color: var(--text); font-weight: 600; }
+.legend .lg-warn { color: var(--warn); }
+.legend .lg-ohlc.up b { color: var(--up); }
+.legend .lg-ohlc.down b { color: var(--down); }
+
+.hint { margin: 8px 2px 0; font-size: 11px; color: var(--muted); }
+.hint b {
+  color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 4px; padding: 0 5px; font-weight: 600;
+}
+
+/* --------------------------------------------------------------- controls */
+
+.segbar { display: inline-flex; gap: 2px; flex-wrap: wrap; }
+.segbar.wrap { max-width: 420px; }
+.seg {
+  font: inherit; font-size: 11px; font-weight: 500;
+  padding: 4px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  cursor: pointer;
+}
+.seg:hover { color: var(--text); }
+.seg.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.seg.ghost { background: transparent; }
+
+.drop { position: relative; font-size: 11px; }
+.drop > summary {
+  list-style: none; cursor: pointer; padding: 4px 9px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+}
+.drop > summary::-webkit-details-marker { display: none; }
+.drop[open] > summary { color: var(--text); }
+.drop > div {
+  position: absolute; z-index: 20; top: calc(100% + 4px); left: 0;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; min-width: 210px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .38);
+}
+.chks { display: grid; gap: 6px; }
+.chk {
+  display: flex; align-items: center; gap: 7px; font-size: 11.5px;
+  color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.chk input[type="number"] { width: 84px; padding: 3px 6px; font-size: 11px; }
+.chk select { padding: 3px 6px; font-size: 11px; }
+
+/* ---------------------------------------------------------------- summary */
+
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.tiles .tile { padding: 8px 10px; gap: 1px; }
+.tiles .tile .v { font-size: 15px; }
+.pane-summary h3 {
+  margin: 16px 0 6px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .6px; color: var(--muted); font-weight: 600;
+}
+
+.kv2 {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0;
+  font-variant-numeric: tabular-nums; font-size: 12px;
+}
+.kv2 dt { color: var(--muted); }
+.kv2 dd { margin: 0; text-align: right; }
+.kv2 dd.up { color: var(--up); }
+.kv2 dd.down { color: var(--down); }
+.kv2 dd.muted { color: var(--muted); }
+
+/* ------------------------------------------------------------ option chain */
+
+.chain-host { overflow: auto; max-height: 46vh; border-radius: 8px; }
+.pad { padding: 18px 6px; }
+
+table.chain {
+  width: 100%; border-collapse: separate; border-spacing: 0;
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
+table.chain thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--panel-2); color: var(--muted);
+  font-size: 10px; letter-spacing: .3px; text-transform: none;
+  padding: 5px 6px; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+table.chain thead tr.side-row th { top: 0; }
+table.chain thead tr:nth-child(2) th { top: 22px; }
+table.chain th.side { text-align: center; letter-spacing: 1px; font-weight: 700; }
+table.chain th.side.call { color: var(--down); }
+table.chain th.side.put { color: var(--up); }
+table.chain th.strike-head { text-align: center; color: var(--text); }
+/* A column the broker does not send. Struck through in the header so the
+   em-dashes below it are explained rather than mysterious. */
+table.chain th.dead { text-decoration: line-through; opacity: .5; }
+
+table.chain td { padding: 3px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.chain td.num { text-align: right; }
+table.chain td.dim { color: var(--muted); }
+table.chain td.ltp { font-weight: 600; cursor: pointer; }
+table.chain tbody tr:hover td { background: var(--panel-2); }
+
+table.chain td.strike {
+  text-align: center; background: var(--panel-2);
+  border-left: 1px solid var(--line); border-right: 1px solid var(--line);
+  position: relative;
+}
+table.chain td.strike b { font-size: 12px; }
+table.chain td.strike .pcr { display: block; font-size: 9px; color: var(--muted); }
+table.chain td.strike.atm { background: #4a3c17; color: #f7e7bd; }
+:root[data-theme="light"] table.chain td.strike.atm { background: #fbeccd; color: #6d4a00; }
+
+/* Moneyness shading on the premium cells only — shading whole rows would make
+   the OI walls, which are the point of the screen, impossible to pick out. */
+table.chain td.itm { background: rgba(91, 157, 255, .10); }
+table.chain td.atm-cell { background: rgba(224, 164, 55, .16); }
+
+/* The heat map from the specification. Only the single extreme strike is
+   painted: a gradient across every large value cannot be ranked by eye. */
+table.chain td.heat-call { background: #5c1e1e; color: #ffd7d7; font-weight: 600; }
+table.chain td.heat-put { background: #12492f; color: #c6f5dd; font-weight: 600; }
+table.chain td.heat-vol { background: #1c3b66; color: #cfe3ff; font-weight: 600; }
+table.chain td.spike { color: var(--accent); font-weight: 600; }
+table.chain td.top { outline: 1px solid var(--warn); outline-offset: -1px; }
+:root[data-theme="light"] table.chain td.heat-call { background: #f7c9c6; color: #7a1c17; }
+:root[data-theme="light"] table.chain td.heat-put { background: #c7ecd7; color: #0b5c33; }
+:root[data-theme="light"] table.chain td.heat-vol { background: #cfe0fb; color: #12447f; }
+
+table.chain tr.row-atm td { border-top: 1px solid var(--warn); border-bottom: 1px solid var(--warn); }
+table.chain tr.near td { background: rgba(224, 164, 55, .05); }
+table.chain tr.selected td { box-shadow: inset 0 0 0 1px var(--accent); }
+
+.swatch {
+  display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  vertical-align: -1px; margin-right: 3px;
+}
+.swatch.spike { background: var(--accent); }
+
+/* --------------------------------------------------------- premium module */
+
+.premium-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 320px); gap: 12px; }
+@media (max-width: 1180px) { .premium-grid { grid-template-columns: minmax(0, 1fr); } }
+.premium-chart { min-width: 0; }
+.premium-side { display: grid; gap: 8px; align-content: start; }
+
+.card-d {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px;
+}
+.card-d > summary {
+  cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--muted); font-weight: 600; list-style: none;
+}
+.card-d > summary::-webkit-details-marker { display: none; }
+.card-d[open] > summary { margin-bottom: 8px; }
+
+.foot-note { margin: 8px 0 0; font-size: 10.5px; color: var(--muted); line-height: 1.45; }
+
+ul.plain { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; font-size: 11.5px; }
+ul.plain .t { color: var(--muted); margin-right: 7px; font-variant-numeric: tabular-nums; }
+ul.alerts b { margin-right: 5px; }
+
+.tag {
+  display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: var(--panel); color: var(--muted); margin-right: 4px;
+}
+.tag.up { background: #17493a; color: #b9f0d8; }
+.tag.down { background: #4a1c1c; color: #f2c2c2; }
+.tag.warn { background: #4a3c17; color: #f0dfb2; }
+
+.alert-toggles { display: grid; gap: 5px; margin-bottom: 10px; }
+
+/* ---------------------------------------------------------------- toasts */
+
+.toasts {
+  position: fixed; right: 16px; bottom: 16px; z-index: 50;
+  display: grid; gap: 8px; max-width: min(420px, 90vw);
+}
+.toast {
+  background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 8px; padding: 9px 12px; font-size: 12px; color: var(--text);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .4);
+}
+.toast.warn { border-left-color: var(--warn); }
+.toast.bad { border-left-color: var(--down); }

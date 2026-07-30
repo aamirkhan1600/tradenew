@@ -10,6 +10,8 @@
     "engine": "node src/engine.js",
     "dev": "nodemon src/app.js",
     "dev:engine": "nodemon src/engine.js",
+    "backfill": "node scripts/backfill-history.js",
+    "backtest": "node scripts/backtest.js",
     "test": "node --test test/"
   },
   "dependencies": {
@@ -20,10 +22,12 @@
     "express": "^4.19.2",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
+    "lightweight-charts": "^5.2.0",
     "mysql2": "^3.11.0",
     "socket.io": "^4.7.5",
     "winston": "^3.13.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "yahoo-finance2": "^3.15.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"

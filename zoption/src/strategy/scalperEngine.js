@@ -48,6 +48,17 @@ const TREND_BUFFER = 12;
 // answering ambiguously is how a bad minute becomes a bad session.
 const STUCK_RETRY_MS = 5000;
 
+// How often the engine says out loud that it is refusing every bar. One line
+// a minute is enough to notice a wedged configuration and rare enough that a
+// normally quiet market does not fill the log.
+const BLOCK_REPORT_MS = 60000;
+
+// How long the engine tolerates having no spot price before it says so as an
+// error. Long enough to cover a boot and a reconnect, short enough that a
+// misconfigured instrument is named within the first minute of a session
+// rather than discovered at the end of one.
+const SPOT_BLIND_MS = 45000;
+
 // A DATETIME field out of a state patch. Absent means "do not touch the column";
 // present-but-null means "clear it". Collapsing the two would make a cleared
 // field silently keep its old value.
@@ -75,6 +86,14 @@ class ScalperEngine extends EventEmitter {
     this._clock = null;
     this._openingCycle = false;
     this.lastError = null;
+
+    // RUN / PAUSE / STOP, written by the web tier into `system_flags` and read
+    // here on every clock. `this.running` is a different thing entirely: it
+    // means the process's clock is ticking. The OPERATOR's intent is this.
+    //
+    // It starts as null rather than as a value, so the first clock is always a
+    // transition and always logs what it found.
+    this.intent = null;
 
     // The index trend filter's whole state: a ring of completed index bars and
     // the verdict derived from them.
@@ -110,6 +129,17 @@ class ScalperEngine extends EventEmitter {
 
     // Adopt whatever the last process left behind before arming anything new.
     await this._resume();
+
+    // Said at boot, not left for the first clock to discover. An operator who
+    // starts the engine and sees nothing happen deserves to be told why on the
+    // line above, rather than reading it out of the dashboard.
+    const intent = await this._readIntent();
+    if (intent !== 'RUN') {
+      logger.warn(`engine: intent is ${intent} — NO NEW CYCLES WILL OPEN. `
+        + `Press Start on the dashboard (${config.appUrl}) or POST /api/start.`,
+      { note: 'open positions are still managed, timed out and squared off' });
+    }
+
     logger.info('engine: started', {
       mode: this.settings.mode, timeframe: this.settings.candleTimeframe,
       tradeMode: this.settings.tradeMode,
@@ -219,9 +249,62 @@ class ScalperEngine extends EventEmitter {
 
   /* ------------------------------------------------------------- the clock */
 
+  // The operator's intent, read fresh each clock.
+  //
+  // THIS WAS MISSING, and it was the whole reason the dashboard's Start, Pause
+  // and Stop buttons did nothing: the web tier wrote the flag, `/api/status`
+  // read it back for display, and no process in between ever acted on it. A
+  // screen reading STOP while a live engine kept selling naked options is the
+  // worst failure this platform could have, and it was the shipped behaviour.
+  //
+  // Three values, and note what STOP does NOT do:
+  //
+  //   RUN    open new cycles normally
+  //   PAUSE  open nothing new; keep managing whatever is open
+  //   STOP   open nothing new; keep managing whatever is open
+  //
+  // STOP does not flatten. Abandoning a live short because someone pressed a
+  // button is not a risk control — it is the same rule `riskManager.canEnter`
+  // is built on, and the square-off is what closes positions. The difference
+  // between STOP and PAUSE is what the operator MEANT, and it is recorded in
+  // the audit trail; the engine treats both as "no new exposure".
+  async _readIntent() {
+    let value;
+    try {
+      // Default STOP, matching what `/api/status` and the dashboard already
+      // show for an unset flag. The alternative — defaulting to RUN — is how
+      // the screen and the engine came to disagree in the first place.
+      value = String(await repo.flags.get('engine_intent', 'STOP')).toUpperCase();
+    } catch (err) {
+      // A database blip must not silently start trading. Hold the last known
+      // intent instead, and if there is none yet, refuse.
+      logger.warn('engine: could not read the operator intent', { err: err.message });
+      return this.intent || 'STOP';
+    }
+    if (!['RUN', 'PAUSE', 'STOP'].includes(value)) value = 'STOP';
+
+    if (value !== this.intent) {
+      const from = this.intent;
+      this.intent = value;
+      logger.warn(`engine: intent is ${value}`, {
+        from: from || '(first read)',
+        effect: value === 'RUN'
+          ? 'new cycles may open'
+          : 'no new cycles will open; open positions keep being managed and squared off',
+      });
+      await this._event({
+        kind: 'CONTROL', fromState: from, toState: value,
+        reason: `engine observed intent ${value}`,
+      }).catch(() => { /* the audit write must not stop the clock */ });
+    }
+    return value;
+  }
+
   async _onClock() {
     if (!this.running) return;
     const now = Date.now();
+
+    const intent = await this._readIntent();
 
     // The instrument master can be empty at boot and populated a minute later,
     // so the trend filter's subscription is retried rather than resolved once.
@@ -235,6 +318,8 @@ class ScalperEngine extends EventEmitter {
     if (this.cycle && time.isAfter(now, this.settings.squareOffAt)) {
       await this._dispatchAll({ type: 'SQUARE_OFF', tsMs: now });
     }
+
+    this._reportBlocks(now);
 
     if (this.cycle) {
       for (const leg of this.legs.values()) {
@@ -259,9 +344,12 @@ class ScalperEngine extends EventEmitter {
         }
       }
       await this._maybeCloseCycle();
-    } else {
+    } else if (intent === 'RUN') {
       await this._maybeOpenCycle(now);
     }
+    // Not RUN and no cycle: nothing to do. Note that everything ABOVE this
+    // branch — the square-off, the timeouts, the stuck-leg recovery — runs
+    // whatever the intent is. Pressing Stop must never strand an open leg.
   }
 
   /* ----------------------------------------------------- stuck-leg recovery */
@@ -562,6 +650,10 @@ class ScalperEngine extends EventEmitter {
     const trend = this._trendGate(leg);
     // Remembered so the entry timeout can say what kept refusing this leg.
     leg.lastGateReason = gate.ok === false ? gate.reason : (trend.ok === false ? trend.reason : null);
+    this._noteBlock(bar.tradable === false
+      ? `the ${bar.timeframe} bar is not tradable (${bar.synthetic ? 'no prints in it'
+        : `only ${bar.tickCount} ticks`})`
+      : leg.lastGateReason);
     await this._dispatch(leg, {
       type: 'CANDLE_CLOSED',
       candle: { ...bar, id: candleId },
@@ -573,6 +665,55 @@ class ScalperEngine extends EventEmitter {
       tsMs: Date.now(),
     });
     this.emit('candle', { ...bar, id: candleId });
+  }
+
+  /* -------------------------------------------------------- block telemetry */
+
+  // WHY IS NOTHING TRADING? — answered without reading the source.
+  //
+  // Every refusal in this engine is individually reasonable and individually
+  // silent. The trend verdict logs only when it CHANGES, so a filter stuck at
+  // NO_DATA says so once and then never again. The premium gate logs at DEBUG.
+  // A bar under `minTicks` is simply not tradable and nothing mentions it. Put
+  // together, a configuration that can never enter looks exactly like a market
+  // that never offered anything — which is the single most expensive ambiguity
+  // this platform can have, because an operator watching a flat P&L has no way
+  // to tell "waiting patiently" from "wedged since 09:25".
+  //
+  // So every refusal is tallied and the tally is published on an interval. It
+  // is a count, not a log line per refusal: at a 15-second candle across two
+  // legs that would be 240 lines an hour saying the same thing.
+  _noteBlock(reason) {
+    if (!reason) {
+      // A bar that passed every gate. The window resets so the summary
+      // describes the recent past rather than the whole session.
+      this._blocks = null;
+      this._blocksSince = 0;
+      return;
+    }
+    if (!this._blocks) { this._blocks = new Map(); this._blocksSince = Date.now(); }
+    // Reasons carry numbers ("the quote is 7s stale"); grouping on the shape
+    // rather than the text keeps the summary to a handful of rows.
+    const key = String(reason).replace(/\d+(\.\d+)?/g, 'N').slice(0, 120);
+    this._blocks.set(key, (this._blocks.get(key) || 0) + 1);
+  }
+
+  // Called from the clock. Emits at most one line per BLOCK_REPORT_MS, and only
+  // while something is actually being refused.
+  _reportBlocks(now) {
+    if (!this._blocks || !this._blocks.size) return;
+    if (now - (this._blocksReportedAt || 0) < BLOCK_REPORT_MS) return;
+    this._blocksReportedAt = now;
+
+    const ranked = [...this._blocks.entries()].sort((a, b) => b[1] - a[1]);
+    const total = ranked.reduce((n, [, c]) => n + c, 0);
+    logger.warn('engine: entries have been refused on every bar', {
+      forSeconds: Math.round((now - this._blocksSince) / 1000),
+      refusals: total,
+      reasons: ranked.slice(0, 4).map(([reason, count]) => `${count}× ${reason}`),
+      hint: 'run `node scripts/diagnose-engine.js`, or `node scripts/dry-run.js` for the '
+        + 'selection path',
+    });
   }
 
   /* ------------------------------------------------- the index trend filter */
@@ -1191,11 +1332,36 @@ class ScalperEngine extends EventEmitter {
     return this.spotToken;
   }
 
+  // No spot means no ATM, which means `_openCycle` returns before it selects
+  // anything — and it does that silently, once a second, forever.
+  //
+  // That is not hypothetical. The index was resolved to the numeric token its
+  // own master publishes, which Kotak answers with an empty array rather than a
+  // price, and the engine sat there for a whole session selecting nothing while
+  // every other check on the dashboard read green. So a spot that never arrives
+  // is now an ERROR that names the instrument, not an early return.
   async _spot() {
     await this._ensureSpot();
     if (!this.spotToken) return null;
     const paise = this.ticker.ltpPaise(this.spotToken.token);
-    return paise == null ? null : paise / 100;
+
+    if (paise == null) {
+      this._blindSince = this._blindSince || Date.now();
+      const blindMs = Date.now() - this._blindSince;
+      if (blindMs > SPOT_BLIND_MS && Date.now() - (this._blindReportedAt || 0) > SPOT_BLIND_MS) {
+        this._blindReportedAt = Date.now();
+        logger.error('engine: NO SPOT PRICE — no cycle can open', {
+          instrument: `${this.spotToken.segment}|${this.spotToken.token}`,
+          blindForSeconds: Math.round(blindMs / 1000),
+          note: 'the feed has never returned a price for this instrument. An index is '
+            + 'quoted by NAME, not by its numeric token — run `node scripts/diagnose-spot.js`.',
+        });
+      }
+      return null;
+    }
+
+    this._blindSince = null;
+    return paise / 100;
   }
 
   async _event(row) {
