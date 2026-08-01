@@ -49,9 +49,17 @@ const {
 // the broker. The revision must be derived from something stable (the
 // confirmation count), so a RETRY of the same rung still collapses onto one
 // order, which is the whole point of the key.
-function clientRef({ cycleId, optionType, attemptSeq, stage, revision = 0 }) {
+// `prefix` names the ENGINE that owns the order — `zo` for the offset scalper,
+// `pf` for the Price-Filter Engine (doc/new.md), `os` for the Option Selling
+// Engine (newdoc/update.md). All three share this table and this router, and
+// their id spaces are independent: cycle 7, pfe trade 7 and ose trade 7 all
+// exist, and without the prefix `ZO-7-CE-1-ENTRY` would be the same key for
+// each. It is also the first thing a human reads in the broker's order book when
+// asking which strategy sent something.
+function clientRef({ prefix = 'zo', cycleId, scopeId, optionType, attemptSeq, stage, revision = 0 }) {
   const rev = Number(revision) > 0 ? `-R${Math.trunc(Number(revision))}` : '';
-  return `zo-${cycleId}-${optionType}-${attemptSeq}-${stage}${rev}`.toUpperCase();
+  const scope = scopeId ?? cycleId;
+  return `${prefix}-${scope}-${optionType}-${attemptSeq}-${stage}${rev}`.toUpperCase();
 }
 
 class OrderRouter {
@@ -69,10 +77,13 @@ class OrderRouter {
   // `limitPriceP` is paise; the conversion to the rupees Kotak's wire format
   // wants happens once, here, at the edge.
   async place({
-    cycleId, legId, optionType, attemptSeq, stage, revision = 0,
+    cycleId, legId, pfeTradeId = null, oseTradeId = null, prefix = 'zo',
+    optionType, attemptSeq, stage, revision = 0,
     token, segment, symbol, side, orderType, qty, limitPriceP = 0, product = 'NRML', tickP = 5,
   }) {
-    const ref = clientRef({ cycleId, optionType, attemptSeq, stage, revision });
+    const ref = clientRef({
+      prefix, scopeId: cycleId ?? pfeTradeId ?? oseTradeId, optionType, attemptSeq, stage, revision,
+    });
 
     // The one rounding boundary between a computed price and an order. An
     // off-tick limit is rejected by the exchange, and rejections are the noisy
@@ -89,7 +100,7 @@ class OrderRouter {
     }
 
     const orderId = await repo.orders.create({
-      clientRef: ref, cycleId, legId, stage, token, segment, symbol,
+      clientRef: ref, cycleId, legId, pfeTradeId, oseTradeId, stage, token, segment, symbol,
       side, orderType, product, limitPriceP: priceP, qty,
     });
 

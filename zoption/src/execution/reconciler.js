@@ -112,6 +112,11 @@ class Reconciler extends EventEmitter {
         clientRef: order.client_ref,
         legId: order.leg_id,
         cycleId: order.cycle_id,
+        // Set on the Price-Filter Engine's orders instead of leg/cycle. Both
+        // engines listen to this reconciler, and each ignores what is not its
+        // own — see the header of src/pfe/engine.js.
+        pfeTradeId: order.pfe_trade_id,
+        oseTradeId: order.ose_trade_id,
         stage: order.stage,
         side: order.side,
         filledQty: bookRow.filledQty || order.qty,
@@ -130,6 +135,8 @@ class Reconciler extends EventEmitter {
         clientRef: order.client_ref,
         legId: order.leg_id,
         cycleId: order.cycle_id,
+        pfeTradeId: order.pfe_trade_id,
+        oseTradeId: order.ose_trade_id,
         stage: order.stage,
         side: order.side,
         filledQty: bookRow.filledQty,
@@ -143,7 +150,9 @@ class Reconciler extends EventEmitter {
       await repo.orders.markCancelled(order.id, 'cancelled at the broker');
       this.emit('cancelled', {
         orderId: order.id, clientRef: order.client_ref,
-        legId: order.leg_id, cycleId: order.cycle_id, stage: order.stage,
+        legId: order.leg_id, cycleId: order.cycle_id,
+        pfeTradeId: order.pfe_trade_id, oseTradeId: order.ose_trade_id,
+        stage: order.stage,
       });
       return;
     }
@@ -152,7 +161,9 @@ class Reconciler extends EventEmitter {
       await repo.orders.markRejected(order.id, bookRow.rejectionReason || 'rejected at the broker');
       this.emit('rejected', {
         orderId: order.id, clientRef: order.client_ref,
-        legId: order.leg_id, cycleId: order.cycle_id, stage: order.stage,
+        legId: order.leg_id, cycleId: order.cycle_id,
+        pfeTradeId: order.pfe_trade_id, oseTradeId: order.ose_trade_id,
+        stage: order.stage,
         reason: bookRow.rejectionReason,
       });
       return;
@@ -187,7 +198,9 @@ class Reconciler extends EventEmitter {
           { ref: order.client_ref, ageMs });
         this.emit('rejected', {
           orderId: order.id, clientRef: order.client_ref,
-          legId: order.leg_id, cycleId: order.cycle_id, stage: order.stage,
+          legId: order.leg_id, cycleId: order.cycle_id,
+        pfeTradeId: order.pfe_trade_id, oseTradeId: order.ose_trade_id,
+          stage: order.stage,
           reason: 'not in the order book',
         });
       }

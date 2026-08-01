@@ -1,0 +1,499 @@
+<%- include('partials/head', { title: 'zoption — option selling engine' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <section class="strip">
+    <div class="tile">
+      <span class="k">Engine</span>
+      <b id="state" class="v">—</b>
+      <span class="sub" id="alive"></span>
+    </div>
+    <div class="tile">
+      <span class="k">Intent</span>
+      <b id="intent" class="v">—</b>
+      <span class="sub" id="intentsub"></span>
+    </div>
+    <!-- The four numbers §11 actually decides on. Without them the page can say
+         the engine is SCANNING but not what it is scanning — and "close
+         24383.60 against a bear mid of 24381.05" is the difference between
+         "nothing is happening" and "it is two points away from selling a CE". -->
+    <div class="tile">
+      <span class="k">NIFTY</span>
+      <b id="spot" class="v">—</b>
+      <span class="sub" id="spotsub"></span>
+    </div>
+    <div class="tile">
+      <span class="k">Trend</span>
+      <b id="trend" class="v">—</b>
+      <span class="sub" id="trendsub"></span>
+    </div>
+    <div class="tile">
+      <span class="k">Bearish mid</span>
+      <b id="bearmid" class="v">—</b>
+      <span class="sub">sell CE below</span>
+    </div>
+    <div class="tile">
+      <span class="k">Bullish mid</span>
+      <b id="bullmid" class="v">—</b>
+      <span class="sub">sell PE above</span>
+    </div>
+    <div class="tile">
+      <span class="k">Broker</span>
+      <b id="broker" class="v">—</b>
+      <span class="sub" id="brokersub"></span>
+    </div>
+    <div class="tile">
+      <span class="k">Mode</span>
+      <b id="mode" class="v">—</b>
+      <span class="sub" id="modesub"></span>
+    </div>
+    <!-- §29. On a Kotak retail entitlement this is `ltp`, and the §9.2 liquidity
+         filters then cannot run at all — the difference between "the market
+         offered nothing" and "this account can never pass the filter". -->
+    <div class="tile">
+      <span class="k">Quote filter</span>
+      <b id="filter" class="v">—</b>
+      <span class="sub" id="filtersub"></span>
+    </div>
+    <div class="tile">
+      <span class="k">Trades today</span>
+      <b id="trades" class="v">—</b>
+      <span class="sub" id="tradessub"></span>
+    </div>
+    <div class="tile wide">
+      <span class="k">Net P&amp;L today</span>
+      <b id="pnl" class="v big">—</b>
+      <span class="sub" id="pnlsub">gross — · charges —</span>
+    </div>
+  </section>
+
+  <section class="controls">
+    <button id="start" class="go">Start</button>
+    <button id="pause" class="warn">Pause entries</button>
+    <button id="stop"  class="stop">Stop &amp; flatten</button>
+    <a class="link" href="/ose/settings">Settings</a>
+    <span class="risknote" id="ctrlnote"></span>
+  </section>
+
+  <!-- §17.6. Terminal for the session, not auto-clearing, and NOT cleared by a
+       restart — so the page offers the runbook rather than a button. -->
+  <section class="card hidden" id="haltbox">
+    <h2 class="down">HALTED <small>no further entries until an operator resets it</small></h2>
+    <p id="haltreason"></p>
+    <p class="muted">
+      Confirm flat at the Kotak terminal — not here — then run
+      <code>node scripts/ose-reset-halt.js --date YYYY-MM-DD --reason "…"</code>
+      and restart the process. There is deliberately no button: §26.6.
+    </p>
+  </section>
+
+  <!-- §22. The list that stands between this engine and real money. -->
+  <section class="card hidden" id="unsignedbox">
+    <h2>Unsigned specification items <small>LIVE mode refuses to start</small></h2>
+    <p id="unsigned" class="muted"></p>
+    <p><a class="link" href="/ose/settings">Record sign-offs on the settings page</a></p>
+  </section>
+
+  <!-- WHY IS NOTHING TRADING? Answered here rather than left to be inferred from
+       a flat P&L, which is the single most expensive ambiguity this platform can
+       have. §11.5 writes one row per sealed candle precisely so this can exist. -->
+  <section class="card">
+    <h2>Why it is not trading <small>every decision today, by outcome</small></h2>
+    <div id="outcomes" class="tally"><span class="muted">—</span></div>
+  </section>
+
+  <!-- WHAT IS IT WATCHING, and what is the open trade worth right now.
+       Both sides are shown even though only one can be traded: the trend picks
+       the side, and seeing the other one is how you tell "no setup" from "no
+       strike in band on that side". -->
+  <section class="card">
+    <h2>Selected strike <small id="watchage">the engine's current pick on each side</small></h2>
+    <div class="tablewrap">
+      <table class="events">
+        <thead>
+          <tr><th>Side</th><th>Strike</th><th>Contract</th><th>Premium</th>
+              <th>Distance</th><th>In band</th></tr>
+        </thead>
+        <tbody id="watchbody">
+          <tr><td colspan="6" class="muted">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint" id="watchnote"></p>
+  </section>
+
+  <!-- Live trade, side by side: what is open on the left, what has closed on
+       the right. Two halves rather than two stacked cards because they answer
+       the same question from opposite ends — "what am I in" and "how has that
+       been going" — and reading one while scrolling to the other loses the
+       comparison. -->
+  <div class="split">
+
+    <section class="card">
+      <h2>Current position <small id="poshead"></small></h2>
+
+      <p class="muted hidden" id="posflat">
+        Flat. The next entry appears here the moment the engine fills one.
+      </p>
+
+      <div class="hidden" id="poslive">
+        <section class="strip">
+          <div class="tile">
+            <span class="k">Premium now</span>
+            <b id="p_prem" class="v">—</b>
+            <span class="sub">last sealed option bar</span>
+          </div>
+          <div class="tile">
+            <span class="k">Open P&amp;L</span>
+            <b id="p_pnl" class="v big">—</b>
+            <span class="sub">gross, before charges</span>
+          </div>
+        </section>
+        <dl class="kv">
+          <dt>Contract</dt><dd id="p_symbol">—</dd>
+          <dt>Size</dt><dd id="p_trend">—</dd>
+          <dt>Entry (fill)</dt><dd id="p_entry">—</dd>
+          <dt>Requested</dt><dd id="p_req">—</dd>
+          <dt>Target</dt><dd id="p_target">—</dd>
+          <dt>Stop</dt><dd id="p_stop">—</dd>
+          <dt>Locked in</dt><dd id="p_locked">—</dd>
+          <dt>Held</dt><dd id="p_held">—</dd>
+        </dl>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Trade list <small>most recent first</small></h2>
+      <div class="tablewrap">
+        <table class="events" id="trades-table">
+          <thead>
+            <tr><th>Date</th><th>Contract</th><th>Entry</th><th>Exit</th>
+                <th>Reason</th><th>Net</th></tr>
+          </thead>
+          <tbody><tr><td colspan="6" class="muted">no trades yet</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <section class="card">
+    <h2>Decision log <small>the last 10 candles &mdash; the tally above counts them all</small></h2>
+    <div class="tablewrap">
+    <table class="events" id="decisions">
+      <thead>
+        <tr>
+          <th>Time</th><th>Outcome</th><th>Trend</th><th>Type</th>
+          <th>Open</th><th>High</th><th>Low</th><th>Close</th>
+          <th>Bear mid</th><th>Bull mid</th><th>Samples</th><th>Detail</th>
+        </tr>
+      </thead>
+      <tbody><tr><td colspan="12" class="muted">—</td></tr></tbody>
+    </table>
+    </div>
+  </section>
+
+
+</main>
+
+<script>
+const rupees = (p) => (p === null || p === undefined) ? '—' : '₹' + (p / 100).toFixed(2);
+// The index is a level, not a price in rupees, and six of these sit side by side
+// in the decision log — the currency symbol on each only costs width.
+const lvl = (p) => (p === null || p === undefined) ? '—' : (p / 100).toFixed(2);
+
+// The candle's own shape — close against open, which is what "candle type"
+// means. Kept SEPARATE from the Samples column, which reports the bar's
+// QUALITY (synthetic, thin): one is what the market did, the other is how well
+// we saw it, and merging them would make a flat market look like a broken feed.
+//
+// A flat bar is reported as DOJI whether it is a real one or a synthetic fill,
+// because that is what its four prices say. Samples is where the difference
+// between "nobody traded" and "we did not look" is shown.
+function candleType(d) {
+  if (d.openP == null || d.closeP == null) return { label: '—', cls: 'muted' };
+  if (d.closeP > d.openP) return { label: 'Bull', cls: 'up' };
+  if (d.closeP < d.openP) return { label: 'Bear', cls: 'down' };
+  // O == H == L == C is the case §11.3 can never accept: both midpoints equal
+  // the close, and the rule needs a STRICT inequality on one of them.
+  const flat = d.highP === d.lowP && d.openP === d.highP;
+  return { label: flat ? 'Flat' : 'Doji', cls: 'muted' };
+}
+const signed = (p) => (p === null || p === undefined) ? '—'
+  : (p < 0 ? '-' : '+') + '₹' + Math.abs(p / 100).toFixed(2);
+const esc = (s) => String(s == null ? '' : s)
+  .replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+const el = (id) => document.getElementById(id);
+const show = (id, on) => el(id).classList.toggle('hidden', !on);
+
+// A failed control must say WHICH failure it was. "Not accepted" covers a
+// refused command, an expired login and a web process running code older than
+// the page it served — three problems with three different fixes, and the last
+// one is invisible otherwise: the page route can exist while the endpoint it
+// posts to does not, because Node loaded the router at boot.
+async function post(path) {
+  el('ctrlnote').textContent = '…';
+  el('ctrlnote').className = 'risknote';
+  try {
+    const res = await fetch('/api/ose' + path, { method: 'POST' });
+    let body = null;
+    try { body = await res.json(); } catch (_) { /* not JSON */ }
+
+    if (res.ok && body && body.ok) {
+      el('ctrlnote').textContent = body.note ? body.intent + ' — ' + body.note : body.intent;
+    } else if (res.status === 404) {
+      el('ctrlnote').textContent = 'this web process is older than the page — restart it '
+        + '(npm start) to pick up the control endpoints';
+      el('ctrlnote').className = 'risknote stale';
+    } else if (res.status === 401 || res.status === 403) {
+      el('ctrlnote').textContent = 'the session expired — sign in again';
+      el('ctrlnote').className = 'risknote stale';
+    } else {
+      el('ctrlnote').textContent = 'refused (HTTP ' + res.status + ')'
+        + (body && body.error ? ': ' + body.error : '');
+      el('ctrlnote').className = 'risknote stale';
+    }
+  } catch (_) {
+    el('ctrlnote').textContent = 'the request did not reach the server';
+    el('ctrlnote').className = 'risknote stale';
+  }
+  refresh();
+}
+el('start').onclick = () => post('/start');
+el('pause').onclick = () => post('/pause');
+el('stop').onclick  = () => {
+  // Stop squares off a live position at market. Worth one click of friction.
+  if (el('posbox').classList.contains('hidden')
+      || confirm('Stop will square off the open position at MARKET. Continue?')) {
+    post('/stop');
+  }
+};
+
+async function refresh() {
+  let s;
+  try {
+    s = await (await fetch('/api/ose/status')).json();
+  } catch (_) {
+    el('alive').textContent = 'the page cannot reach the server';
+    el('alive').className = 'sub stale';
+    return;
+  }
+  if (!s.ok) return;
+
+  const eng = s.engine;
+  el('state').textContent = eng ? eng.state : 'not running';
+  // The distinction that matters most on this page: an engine saying nothing is
+  // tradable looks identical to an engine that is not running.
+  el('alive').textContent = s.running
+    ? 'live · ' + Math.round(eng.ageMs / 1000) + 's ago'
+    : (eng ? 'STALE — the process is not running' : 'start it with npm run ose');
+  el('alive').className = 'sub' + (s.running ? '' : ' stale');
+
+  el('intent').textContent = s.intent;
+  // What was clicked vs what the engine has picked up. They differ for up to one
+  // safety-timer tick, and showing only the first would let the page claim a
+  // state the engine is not in.
+  el('intentsub').textContent = !s.running ? 'the engine is not reading it'
+    : (s.engineIntent === s.intent ? 'the engine has it'
+      : 'engine still on ' + (s.engineIntent || '—'));
+  el('intentsub').className = 'sub'
+    + (s.running && s.engineIntent !== s.intent ? ' stale' : '');
+
+  // The strategy in four numbers, from the most recent SEALED candle — the same
+  // data the engine decided on, not a live quote it is not allowed to read.
+  const m = s.market;
+  el('spot').textContent = m ? rupees(m.closeP) : '—';
+  el('spotsub').textContent = m
+    ? m.at + ' · ' + m.tickCount + ' sample' + (m.tickCount === 1 ? '' : 's')
+      + (m.synthetic ? ' · synthetic' : (m.lowConfidence ? ' · thin' : ''))
+    : 'no sealed candle yet';
+  el('spotsub').className = 'sub' + (m && (m.synthetic || m.lowConfidence) ? ' stale' : '');
+
+  el('trend').textContent = m ? m.trend : '—';
+  el('trend').className = 'v ' + (m && m.trend === 'BULLISH' ? 'up'
+    : (m && m.trend === 'BEARISH' ? 'down' : ''));
+  el('trendsub').textContent = m && m.trendVia ? m.trendVia.toLowerCase().replace(/_/g, ' ') : '';
+
+  el('bearmid').textContent = m ? rupees(m.bearishMidP) : '—';
+  el('bullmid').textContent = m ? rupees(m.bullishMidP) : '—';
+  // Light the side the close has actually broken, so which way it is leaning is
+  // visible without comparing three numbers by eye.
+  el('bearmid').className = 'v' + (m && m.closeP < m.bearishMidP ? ' down' : '');
+  el('bullmid').className = 'v' + (m && m.closeP > m.bullishMidP ? ' up' : '');
+
+  el('broker').textContent = s.broker.status;
+  el('brokersub').textContent = s.broker.ucc || s.broker.lastError || '';
+
+  el('mode').textContent = s.mode;
+  el('modesub').textContent = s.mode === 'PAPER'
+    ? 'simulated — nothing reaches the exchange' : 'orders reach the exchange';
+
+  const ltpOnly = eng && eng.filter === 'ltp';
+  el('filter').textContent = (eng && eng.filter) || '—';
+  el('filtersub').textContent = (s.liquidityMode === 'STRICT' && ltpOnly)
+    ? 'STRICT + ltp-only: no strike can ever be selected'
+    : 'liquidity mode ' + s.liquidityMode;
+  el('filtersub').className = 'sub'
+    + ((s.liquidityMode === 'STRICT' && ltpOnly) ? ' stale' : '');
+
+  el('trades').textContent = s.stats.tradesToday;
+  el('tradessub').textContent =
+    s.stats.wins + 'W / ' + s.stats.losses + 'L / ' + s.stats.scratches + ' scratch · '
+    + s.stats.consecutiveLosses + ' in a row';
+
+  el('pnl').textContent = signed(s.stats.netP);
+  el('pnl').className = 'v big ' + (s.stats.netP < 0 ? 'down' : (s.stats.netP > 0 ? 'up' : ''));
+  el('pnlsub').textContent =
+    'gross ' + signed(s.stats.grossP) + ' · charges ' + rupees(s.stats.chargesP)
+    + ' · ' + s.stats.cycles + ' cycles, ' + s.stats.entries + ' entries';
+
+  show('haltbox', s.stats.halted);
+  if (s.stats.halted) el('haltreason').textContent = s.stats.haltReason || '';
+
+  show('unsignedbox', s.unsigned.length > 0);
+  if (s.unsigned.length) {
+    el('unsigned').textContent = s.unsigned.length + ' unsigned: '
+      + s.unsigned.map(u => '#' + u.id + ' ' + u.item).join(' · ');
+  }
+
+  const tally = s.outcomes || [];
+  el('outcomes').innerHTML = tally.length
+    ? tally.map(o => '<span class="pill' + (o.outcome === 'ENTRY_TAKEN' ? ' on' : '') + '">'
+        + esc(o.outcome) + ' <b>' + o.n + '</b></span>').join('')
+    : '<span class="muted">no cycles yet today</span>';
+
+  // Selected strike, both sides.
+  const w = s.watch;
+  const wb = el('watchbody');
+  if (!w || (!w.ce && !w.pe)) {
+    wb.innerHTML = '<tr><td colspan="6" class="muted">'
+      + (s.running ? 'no chain snapshot yet — the engine fetches one while scanning'
+                   : 'the engine is not running')
+      + '</td></tr>';
+    el('watchage').textContent = "the engine's current pick on each side";
+    el('watchnote').textContent = '';
+  } else {
+    const band = s.bandMinP != null
+      ? '₹' + (s.bandMinP / 100).toFixed(0) + '–' + (s.bandMaxP / 100).toFixed(0) : '';
+    const row = (side, c) => {
+      if (!c) {
+        return '<tr><td>' + side + '</td><td colspan="5" class="muted">'
+          + 'nothing in band ' + band + '</td></tr>';
+      }
+      const away = side === 'CE' ? c.strike - w.atmStrike : w.atmStrike - c.strike;
+      const where = away === 0 ? 'at the money' : away + ' pts OTM';
+      return '<tr>'
+        + '<td>' + side + '</td>'
+        + '<td>' + c.strike + '</td>'
+        + '<td>' + esc(c.symbol || (side + ' ' + c.strike)) + '</td>'
+        + '<td>' + rupees(c.ltpP) + '</td>'
+        + '<td class="' + (away === 0 ? 'down' : '') + '">' + where + '</td>'
+        + '<td>' + c.candidates + '</td>'
+        + '</tr>';
+    };
+    wb.innerHTML = row('CE', w.ce) + row('PE', w.pe);
+    el('watchage').textContent = w.ageMs != null
+      ? 'as of ' + Math.round(w.ageMs / 1000) + 's ago · spot ' + lvl(w.spotP)
+        + ' · ATM ' + w.atmStrike
+      : '';
+    el('watchnote').textContent = 'Only the side the trend asks for can be traded. '
+      + 'A strike at the money is the most credit and the most risk in the band.';
+  }
+
+  // The left half always says SOMETHING — an empty column reads as a broken
+  // panel, where "Flat" is a real and useful answer.
+  show('posflat', !s.position);
+  show('poslive', Boolean(s.position));
+  if (s.position) {
+    const p = s.position;
+    const mark = w && w.position ? w.position : null;
+    el('poshead').textContent = p.state;
+    el('p_symbol').textContent = p.symbol;
+    el('p_trend').textContent = p.qty + ' × ' + p.optionType + ' · entered ' + p.trend;
+    el('p_held').textContent = p.candlesHeld + ' candles · rung ' + p.targetLevel;
+    el('p_entry').textContent = rupees(p.entryP);
+    el('p_req').textContent = 'asked ' + rupees(p.requestedP);
+    el('p_prem').textContent = mark ? rupees(mark.premiumP) : '—';
+    el('p_pnl').textContent = mark ? signed(mark.unrealisedP) : '—';
+    el('p_pnl').className = 'v big ' + (mark && mark.unrealisedP < 0 ? 'down'
+      : (mark && mark.unrealisedP > 0 ? 'up' : ''));
+    el('p_target').textContent = rupees(p.targetP);
+    el('p_stop').textContent = rupees(p.stopP);
+    // What the stop has actually locked in, which is the number that says
+    // whether this trade can still lose.
+    const locked = p.entryP != null && p.stopP != null ? p.entryP - p.stopP : null;
+    // What the stop has actually secured — the number that says whether this
+    // trade can still lose.
+    el('p_locked').textContent = locked == null ? '—'
+      : (locked > 0 ? rupees(locked) + ' secured'
+        : (locked === 0 ? 'breakeven' : 'risking ' + rupees(-locked)));
+    el('p_locked').className = locked > 0 ? 'up' : (locked < 0 ? 'down' : '');
+  }
+}
+
+async function refreshDecisions() {
+  const r = await (await fetch('/api/ose/decisions?limit=10')).json();
+  const body = document.querySelector('#decisions tbody');
+  if (!r.ok || !r.decisions.length) {
+    body.innerHTML = '<tr><td colspan="12" class="muted">no decisions yet</td></tr>';
+    return;
+  }
+  body.innerHTML = r.decisions.map(d => {
+    const thin = d.synthetic ? 'synthetic' : (d.lowConfidence ? 'thin' : '');
+    const t = candleType(d);
+    return '<tr>'
+      + '<td>' + esc(d.at) + '</td>'
+      + '<td class="' + (d.outcome === 'ENTRY_TAKEN' ? 'up' : '') + '">' + esc(d.outcome) + '</td>'
+      + '<td>' + esc(d.trend) + (d.trendVia ? ' <small class="muted">' + esc(d.trendVia) + '</small>' : '') + '</td>'
+      + '<td class="' + t.cls + '">' + t.label + '</td>'
+      + '<td>' + lvl(d.openP) + '</td>'
+      + '<td>' + lvl(d.highP) + '</td>'
+      + '<td>' + lvl(d.lowP) + '</td>'
+      // The close is what §11.3 compares against the midpoints, so it is the one
+      // of the four that decides — marked up when it broke the bullish mid and
+      // down when it broke the bearish one.
+      + '<td class="' + (d.closeP > d.bullishMidP ? 'up' : (d.closeP < d.bearishMidP ? 'down' : '')) + '">'
+        + lvl(d.closeP) + '</td>'
+      + '<td>' + lvl(d.bearishMidP) + '</td>'
+      + '<td>' + lvl(d.bullishMidP) + '</td>'
+      + '<td>' + d.tickCount + (thin ? ' <small class="down">' + thin + '</small>' : '') + '</td>'
+      + '<td class="muted">' + esc(d.detail || '') + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+async function refreshTrades() {
+  const r = await (await fetch('/api/ose/trades?limit=40')).json();
+  const body = document.querySelector('#trades-table tbody');
+  if (!r.ok || !r.trades.length) {
+    body.innerHTML = '<tr><td colspan="10" class="muted">no trades yet</td></tr>';
+    return;
+  }
+  body.innerHTML = r.trades.map(t => {
+    // §9.2.1 — say when a strike was chosen without the liquidity filters.
+    const skipped = t.select && t.select.skipped && t.select.skipped.length
+      ? ' <small class="down">no ' + esc(t.select.skipped.join('/')) + '</small>' : '';
+    return '<tr>'
+      + '<td>' + esc(t.date) + '</td>'
+      + '<td>' + esc(t.symbol) + skipped + '</td>'
+      + '<td>' + rupees(t.entryP) + '</td>'
+      + '<td>' + rupees(t.exitP) + '</td>'
+      + '<td>' + esc(String(t.exitReason || '').replace(/^EXIT_/, '')) + '</td>'
+      + '<td class="' + (t.netP < 0 ? 'down' : 'up') + '">' + signed(t.netP) + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+function tick() {
+  refresh().catch(() => {});
+  refreshDecisions().catch(() => {});
+  refreshTrades().catch(() => {});
+}
+tick();
+setInterval(refresh, 2000);
+setInterval(refreshDecisions, 5000);
+setInterval(refreshTrades, 10000);
+</script>
+
+<%- include('partials/foot') %>

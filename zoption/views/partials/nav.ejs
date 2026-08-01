@@ -1,14 +1,19 @@
 <header class="nav">
   <div class="brand">
     zoption
-    <span class="brand-sub">NIFTY offset scalper</span>
+    <span class="brand-sub">NIFTY option selling</span>
   </div>
+  <!-- Three links on purpose. The scalper's and the Price-Filter engine's pages
+       still EXIST and still work — /, /pfe, /trades, /events and /settings are
+       unchanged — they are simply not advertised here, because this deployment
+       runs the Option Selling Engine and a nav offering three engines invites
+       an operator to configure the one that is not running.
+
+       The OSE's own settings live at /ose/settings, linked from the /ose page,
+       so removing the global Settings link does not strand anything. -->
   <nav>
-    <a href="/"          class="<%= page === 'dashboard' ? 'on' : '' %>">Dashboard</a>
+    <a href="/ose"       class="<%= page === 'ose'       ? 'on' : '' %>">Option Selling</a>
     <a href="/terminal"  class="<%= page === 'terminal'  ? 'on' : '' %>">Terminal</a>
-    <a href="/trades"    class="<%= page === 'trades'    ? 'on' : '' %>">Trades</a>
-    <a href="/events"    class="<%= page === 'events'    ? 'on' : '' %>">Audit</a>
-    <a href="/settings"  class="<%= page === 'settings'  ? 'on' : '' %>">Settings</a>
     <a href="/brokers"   class="<%= page === 'brokers'   ? 'on' : '' %>">Broker</a>
   </nav>
   <form method="post" action="/logout" class="logout">

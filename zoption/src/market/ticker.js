@@ -186,6 +186,28 @@ class Ticker extends EventEmitter {
     return this;
   }
 
+  // Bring a stopped ticker back up after a FRESH session has been obtained.
+  //
+  // The counterpart to `_failAuth`, and the reason that one refuses to retry:
+  // a reconnect loop against a rejected session is noise, but a ticker that can
+  // never come back turns a daily 06:00 token expiry into a permanently blind
+  // engine that still looks healthy. This is the explicit, evidence-based
+  // revival — the caller has checked `session.isActive()` first.
+  //
+  // `session` is read through `sessionService`, so the new token is already
+  // visible here; only the two latches need clearing.
+  resume() {
+    if (!this.session?.sessionToken || !this.session?.sid) return this;
+    if (!this.closed && !this.authFailed) return this;      // already running
+
+    logger.info('ticker: resuming on a fresh session', { label: this.label });
+    this.closed = false;
+    this.authFailed = false;
+    this.lastError = null;
+    this.reconnectAttempts = 0;
+    return this.connect();
+  }
+
   close() {
     this.closed = true;
     for (const t of ['_reconnectTimer', '_pollTimer']) {

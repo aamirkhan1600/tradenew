@@ -1,0 +1,26 @@
+{
+  "_note": [
+    "newdoc/update.md §17.7 — the exchange trading calendar.",
+    "",
+    "THIS FILE SHIPS EMPTY ON PURPOSE. A holiday list is a safety device, and a",
+    "wrong one is worse than an absent one: a date this file gets wrong is a day",
+    "the engine either sits out a live session or, far worse, tries to trade a",
+    "closed exchange and spends the morning interpreting silence as a quiet tape.",
+    "",
+    "So it is not guessed. Fill `dates` from the NSE trading-holiday circular for",
+    "the year before the first production session.",
+    "",
+    "What the engine does with it (src/ose/risk.js — validateCalendar):",
+    "  * empty or unreadable  -> refuses to start in production, warns elsewhere",
+    "  * no date on or after today in the current year -> treated as STALE, same",
+    "    refusal. A calendar that ran out in December is a calendar nobody",
+    "    maintained.",
+    "  * weekends are detected from the IST day of week and are NOT listed here.",
+    "",
+    "Format: either a plain 'YYYY-MM-DD' string or { date, name }. Both are",
+    "accepted so the list can carry the holiday's name without a second file."
+  ],
+  "exchange": "NSE",
+  "segment": "F&O",
+  "dates": []
+}

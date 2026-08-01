@@ -8,8 +8,12 @@
     "migrate": "node db/migrate.js",
     "start": "node src/app.js",
     "engine": "node src/engine.js",
+    "pfe": "node src/pfeEngine.js",
+    "ose": "node src/oseEngine.js",
     "dev": "nodemon src/app.js",
     "dev:engine": "nodemon src/engine.js",
+    "dev:pfe": "nodemon src/pfeEngine.js",
+    "dev:ose": "nodemon src/oseEngine.js",
     "backfill": "node scripts/backfill-history.js",
     "backtest": "node scripts/backtest.js",
     "test": "node --test test/"

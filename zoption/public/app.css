@@ -138,6 +138,15 @@ button.stop { background: #4a1c1c; border-color: #6d2626; color: #f2c2c2; }
 .s-POSITION_OPEN { background: #17493a; color: #b9f0d8; }
 .s-EXITING { background: #4a1c1c; color: #f2c2c2; }
 .s-DONE { background: #2a3040; color: var(--muted); }
+/* The Price-Filter Engine's two extra states. ARMED is blue rather than amber:
+   a contract is held but NOTHING is live at the broker yet, and confusing that
+   with a working order is the one misreading that matters on this page. */
+.s-ARMED { background: #1c3350; color: #bcd8f5; }
+.s-TARGET_MOVING { background: #4a3c17; color: #f0dfb2; }
+
+/* A field the broker does not send. Never rendered as a zero — see
+   src/pfe/scanner.js. */
+.unavail { color: #b58b3a; font-size: 11px; }
 
 /* ---------------------------------------------------------------- tables - */
 
@@ -199,3 +208,50 @@ input[readonly] { color: var(--muted); }
   padding: 24px 20px; text-align: center; color: var(--muted); font-size: 12px;
   border-top: 1px solid var(--line); margin-top: 20px;
 }
+
+/* ------------------------------------------- option selling engine (/ose) - */
+
+/* The decision tally. One pill per outcome, so "why is it not trading" is a
+   glance rather than a scroll — on this account the honest answer is usually a
+   single pill with a four-figure count next to it. */
+.tally { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 999px; padding: 5px 12px; font-size: 12px;
+}
+.pill b { font-variant-numeric: tabular-nums; font-size: 13px; }
+.pill.on { border-color: #1e6a53; background: #17493a; color: #b9f0d8; }
+
+/* Two equal halves — the 6/6 row. Collapses to one column below the point where
+   half a screen stops being wide enough to read a table in, rather than at a
+   device breakpoint: what matters is the content's width, not the phone's. */
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+/* Inside half a row the tile grid needs a smaller floor or it never fits two
+   across. */
+.split .strip { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+.split .tablewrap table { min-width: 0; }
+
+/* Wide tables scroll THEMSELVES rather than making the page scroll sideways.
+   The decision log is eight columns and the trade log ten; without this the
+   whole console shifts and the nav goes off-screen while you read a number. */
+.tablewrap { overflow-x: auto; }
+.tablewrap table { min-width: 720px; }
+
+/* The §22 sign-off register reads as a checklist, so an unsigned row must be
+   visible without reading it. */
+.signoff td { vertical-align: top; }
+.signoff td .hint { margin-top: 2px; max-width: 46ch; }
+.signoff input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--up); }
+.signed td:first-child { border-left: 2px solid var(--up); }
+.unsigned td:first-child { border-left: 2px solid var(--down); }
+
+/* A checkbox must not inherit the text-input padding — `input` is styled
+   globally for text and selects, which makes a bare checkbox enormous. */
+input[type="checkbox"] { padding: 0; width: auto; }
+
+/* An engine that is not running must not look like an engine with nothing to
+   say — the two need opposite responses from an operator. */
+.stale { color: var(--down); font-weight: 600; }

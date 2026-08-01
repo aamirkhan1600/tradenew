@@ -16,6 +16,7 @@ const db = require('./core/db');
 const money = require('./core/money');
 const routes = require('./http/routes');
 const socket = require('./http/socket');
+const { EngineSupervisor } = require('./engineSupervisor');
 
 const app = express();
 
@@ -59,6 +60,26 @@ app.use('/static/vendor', express.static(
 app.locals.money = money;
 app.locals.appName = 'zoption';
 
+// Cache-buster for the stylesheet.
+//
+// /static is served with `maxAge: '1h'`, which is right for a file that rarely
+// changes and wrong on the day it does: the browser keeps the old copy for an
+// hour and a new rule simply does not exist as far as the page is concerned.
+// A changed CSS rule then looks like a broken layout, and the only cure anyone
+// finds is a hard refresh they should never have needed.
+//
+// The file's modification time is the version, so the URL changes exactly when
+// the file does — cache hits stay cache hits, and an edit is picked up on the
+// next restart.
+app.locals.assetV = (() => {
+  try {
+    return String(Math.floor(
+      require('fs').statSync(path.join(__dirname, '..', 'public', 'app.css')).mtimeMs));
+  } catch (_) {
+    return String(Date.now());
+  }
+})();
+
 app.use(routes);
 
 app.use((req, res) => {
@@ -86,18 +107,30 @@ app.use((err, req, res, next) => {
 const server = http.createServer(app);
 const sockets = socket.attach(server);
 
+// `npm start` brings up the trading engine too — see src/engineSupervisor.js for
+// what that couples together and why it is survivable.
+const engineSupervisor = new EngineSupervisor();
+
 async function boot() {
   if (!await db.healthCheck()) {
     throw new Error('the database is not reachable — check DB_* in .env and run npm run migrate');
   }
   server.listen(config.port, () => {
     logger.info(`app: listening on ${config.appUrl}`);
-    logger.info('app: this process does not trade — run `npm run engine` alongside it');
+    // The web tier still places no orders itself. It now supervises the process
+    // that does, which is a different claim from doing the trading.
+    engineSupervisor.start();
+    if (!config.ose.autostart) {
+      logger.info('app: this process does not trade — run `npm run ose` alongside it');
+    }
   });
 }
 
 async function shutdown() {
   logger.info('app: shutting down');
+  // Stop the engine FIRST so it can release the leader lock and close its own
+  // pool while the process is still alive to do it.
+  try { engineSupervisor.stop(); } catch (_) { /* ignore */ }
   try { sockets.close(); } catch (_) { /* ignore */ }
   server.close(async () => {
     await db.close();

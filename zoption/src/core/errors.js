@@ -55,6 +55,22 @@ class BrokerUncertainError extends AppError {
   }
 }
 
+// An invariant the system is built on did not hold — a stop that tried to widen,
+// an illegal state transition, a broker position nobody recognises.
+//
+// newdoc/update.md §20.2 puts this class in its own row of the error taxonomy
+// with one response and no discretion: HALT immediately. Everything else in this
+// file describes something the OUTSIDE world did; this one describes the engine
+// being wrong about itself, and continuing from that is how a bad assumption
+// becomes a bad position.
+class IntegrityError extends AppError {
+  constructor(message, meta = null) {
+    super(message, 500, 'integrity_error', meta);
+    this.retryable = false;
+    this.halts = true;
+  }
+}
+
 // The local rate limiter refused BEFORE anything was sent. Nothing reached the
 // broker, so retrying is always safe.
 class RateLimitedError extends AppError {
@@ -68,4 +84,5 @@ class RateLimitedError extends AppError {
 module.exports = {
   AppError, ValidationError, AuthError, NotFoundError, ConflictError,
   BrokerAuthError, BrokerRejectedError, BrokerUncertainError, RateLimitedError,
+  IntegrityError,
 };

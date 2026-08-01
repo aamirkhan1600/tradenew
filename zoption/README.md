@@ -20,6 +20,12 @@ Three documents, three jobs:
 | [`doc/PROJECT_PLAN.md`](doc/PROJECT_PLAN.md) | The spec of record: where the source documents contradict each other and how each was resolved (R1–R9a). Read §2 before changing entry or exit logic. |
 | `doc/flow.md`, `doc/update-point.md`, `doc/traling-traget -stoploss.md` | The source specifications, as written. |
 
+There is also a **second, complete engine** in this repository —
+[`doc/PFE.md`](doc/PFE.md), the Price-Filter Engine of
+[`doc/new.md`](doc/new.md). Different strategy, different route, different
+process; same broker, same order table, same safety rules. See
+[below](#the-price-filter-engine).
+
 ---
 
 ## The strategy in one screen
@@ -208,10 +214,47 @@ one seen. Paper results should still be read as an optimistic bound.
 
 ---
 
+## The Price-Filter Engine
+
+A second strategy lives in this repository: **[`doc/PFE.md`](doc/PFE.md)**, the
+implementation of [`doc/new.md`](doc/new.md). It is a different engine, not a
+mode of this one.
+
+```bash
+npm run pfe                   # its trading process
+                              # console -> http://localhost:4100/pfe
+```
+
+Where the scalper locks a strike and sells its candle closes, the PFE re-derives
+everything every five seconds:
+
+```
+3 index candles of higher highs + higher lows          →  which side may sell
+the live price against that candle's (O+H)/2 midpoint  →  may it sell right now
+premium ₹12–30, liquidity, a score out of 100          →  which strike
+that contract's own candle close + offset              →  at what price
+every later candle: still valid? → target 1→2→3→4      →  or exit immediately
+```
+
+**`npm run pfe` and `npm run engine` contend for the same leader lock.** One
+account, two strategies that both sell naked options: exactly one may be live at
+a time, and the second to start refuses rather than doubling the exposure.
+
+Two things to read before running it live, both covered in `doc/PFE.md`:
+
+- **Its liquidity filter is only as good as your quote entitlement.** Kotak's
+  retail Trade API sends no open interest, volume or depth, so in `LENIENT` mode
+  the strike is chosen on premium alone and in `STRICT` mode nothing is ever
+  selected. Both states are reported on the page and at boot rather than looking
+  like a quiet market.
+- **`doc/new.md`'s 1.0 target against a 2.0 stop needs a ~70% hit rate** before
+  charges. The dynamic target ladder is the entire answer to that, which is why
+  it defaults to ON and why turning it off warns.
+
 ## Testing
 
 ```bash
-npm test        # 235 tests, no database, no broker, ~1s
+npm test        # 387 tests, no database, no broker, ~3s
 ```
 
 Three invariants get dedicated tests because a violation costs money:
@@ -219,6 +262,10 @@ Three invariants get dedicated tests because a violation costs money:
 - **I1** — no order is priced from a quote, tick, ask, bid or LTP.
 - **I2** — a leg never has two working SELL orders.
 - **I3** — no exit market order is sent while a target is still working.
+
+The Price-Filter Engine has its own copies of all three (plus "a round trip is
+booked exactly once"), asserted against its own source rather than inherited —
+two engines that share an order table must each be able to prove it separately.
 
 The terminal's maths is tested against things that can be looked up rather than
 against itself: the greeks against the textbook reference set and put-call

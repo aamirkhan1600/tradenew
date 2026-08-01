@@ -84,6 +84,14 @@ async function patch(conn) {
   }
   if (await tableExists('orders')) {
     await addIndex(conn, 'orders', 'idx_orders_cycle', 'KEY idx_orders_cycle (cycle_id, stage)');
+    // The Price-Filter Engine (doc/new.md) shares this table. Its orders carry
+    // a trade id instead of a leg id and a `pf-` client_ref instead of `zo-`.
+    await addColumn(conn, 'orders', 'pfe_trade_id', 'pfe_trade_id INT UNSIGNED NULL');
+    await addIndex(conn, 'orders', 'idx_orders_pfe', 'KEY idx_orders_pfe (pfe_trade_id, stage)');
+    // The Option Selling Engine (newdoc/update.md) shares this table too. Its
+    // orders carry an `os-` client_ref and an ose_trade_id.
+    await addColumn(conn, 'orders', 'ose_trade_id', 'ose_trade_id INT UNSIGNED NULL');
+    await addIndex(conn, 'orders', 'idx_orders_ose', 'KEY idx_orders_ose (ose_trade_id, stage)');
   }
 
   // Bars downloaded from Yahoo to give the charts the history Kotak has no
@@ -94,6 +102,20 @@ async function patch(conn) {
     await addColumn(conn, 'candles', 'source',
       "source ENUM('LIVE','BACKFILL') NOT NULL DEFAULT 'LIVE'");
     await rekeyIndexCandles(conn);
+  }
+
+  // newdoc/update.md §19.4. The sample count behind each decision, and whether
+  // it was too thin to trade on (§7.8).
+  //
+  // Defaulting `tick_count` to 0 on rows written before this column existed is
+  // deliberate and is NOT the same claim as "that bar had no samples": a zero
+  // here means "not recorded". Anything reading the distribution must filter to
+  // rows written after the migration, which is what the id ordering is for.
+  if (await tableExists('ose_decisions')) {
+    await addColumn(conn, 'ose_decisions', 'low_confidence',
+      'low_confidence TINYINT(1) NOT NULL DEFAULT 0 AFTER synthetic');
+    await addColumn(conn, 'ose_decisions', 'tick_count',
+      'tick_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER low_confidence');
   }
 }
 
@@ -242,21 +264,129 @@ const DEFAULT_SETTINGS = {
   mode: 'PAPER',
 };
 
+// The Price-Filter Engine's profile — doc/new.md, and src/pfe/settings.js is
+// the authority. Required here rather than duplicated: a second copy of a
+// hundred risk parameters is a second copy to drift.
+//
+// Loaded lazily and defensively. `npm run migrate` must work on a checkout
+// whose .env is not filled in yet, and src/config/index.js exits the process on
+// a missing TOKEN_ENC_KEY — so a require() at the top of this file would turn
+// "run the migration first" into a chicken-and-egg problem.
+function pfeDefaults() {
+  try {
+    // eslint-disable-next-line global-require
+    return require('../src/pfe/settings').DEFAULTS;
+  } catch (err) {
+    console.log(`  ! could not load the Price Filter defaults (${err.message})`);
+    console.log('    — fill in .env and re-run `npm run migrate` to seed that profile');
+    return null;
+  }
+}
+
+// The Option Selling Engine's profile — newdoc/update.md §5.1, and
+// src/ose/settings.js is the authority. Same lazy, defensive load as the Price
+// Filter's for the same reason.
+function oseDefaults() {
+  try {
+    // eslint-disable-next-line global-require
+    return require('../src/ose/settings').DEFAULTS;
+  } catch (err) {
+    console.log(`  ! could not load the Option Selling defaults (${err.message})`);
+    console.log('    — fill in .env and re-run `npm run migrate` to seed that profile');
+    return null;
+  }
+}
+
 async function seed(conn) {
+  let seeded = false;
+
   const [rows] = await conn.query('SELECT id FROM settings WHERE name = ? LIMIT 1', ['default']);
-  if (rows.length) return false;
-  await conn.query('INSERT INTO settings (name, payload, version) VALUES (?, ?, 1)',
-    ['default', JSON.stringify(DEFAULT_SETTINGS)]);
-  console.log('  + seeded settings "default" (mode: PAPER)');
-  return true;
+  if (!rows.length) {
+    await conn.query('INSERT INTO settings (name, payload, version) VALUES (?, ?, 1)',
+      ['default', JSON.stringify(DEFAULT_SETTINGS)]);
+    console.log('  + seeded settings "default" (mode: PAPER)');
+    seeded = true;
+  }
+
+  const [pfe] = await conn.query('SELECT id FROM settings WHERE name = ? LIMIT 1', ['pfe']);
+  if (!pfe.length) {
+    const defaults = pfeDefaults();
+    if (defaults) {
+      await conn.query('INSERT INTO settings (name, payload, version) VALUES (?, ?, 1)',
+        ['pfe', JSON.stringify(defaults)]);
+      console.log('  + seeded settings "pfe" — the Price-Filter Engine (mode: PAPER)');
+      seeded = true;
+    }
+  }
+
+  const [ose] = await conn.query('SELECT id FROM settings WHERE name = ? LIMIT 1', ['ose']);
+  if (!ose.length) {
+    const defaults = oseDefaults();
+    if (defaults) {
+      await conn.query('INSERT INTO settings (name, payload, version) VALUES (?, ?, 1)',
+        ['ose', JSON.stringify(defaults)]);
+      console.log('  + seeded settings "ose" — the Option Selling Engine (mode: PAPER)');
+      console.log('    ! liquidityMode ships STRICT (newdoc/update.md §9.2 read literally).');
+      console.log('      On a Kotak retail entitlement NO STRIKE WILL EVER BE SELECTED in that');
+      console.log('      mode — see [MUST-CONFIRM #10] and /ose/settings.');
+      seeded = true;
+    }
+  }
+
+  return seeded;
+}
+
+// New keys added to the Price Filter profile after a deploy. Same rule as
+// backfillSettings() below: absent keys are filled from the defaults, keys the
+// operator has set are never touched.
+async function backfillPfeSettings(conn) {
+  const defaults = pfeDefaults();
+  if (!defaults) return;
+  const [rows] = await conn.query('SELECT id, name, payload FROM settings WHERE name = ?', ['pfe']);
+  for (const row of rows) {
+    const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+    const added = [];
+    for (const [key, value] of Object.entries(defaults)) {
+      if (payload[key] === undefined) { payload[key] = value; added.push(key); }
+    }
+    if (!added.length) continue;
+    await conn.query('UPDATE settings SET payload = ?, version = version + 1 WHERE id = ?',
+      [JSON.stringify(payload), row.id]);
+    console.log(`  + settings "pfe": ${added.join(', ')}`);
+  }
 }
 
 // The settings row is a JSON blob, so a new config key is a data migration
 // rather than a schema one: an existing profile has no `trendFilter` and would
 // fail validation on the next boot. Absent keys are filled from the defaults;
 // keys the operator has already set are never touched.
+// Scoped to the scalper's own profiles. The Price-Filter Engine keeps its
+// configuration in a row called `pfe` and the Option Selling Engine in one
+// called `ose`, both with completely different key sets, and an unscoped
+// backfill would pour a hundred scalper keys into them — every one of which
+// their validators would then have to ignore, and one of which (`target`) means
+// something different in each engine.
+// The same, for the Option Selling Engine's profile.
+async function backfillOseSettings(conn) {
+  const defaults = oseDefaults();
+  if (!defaults) return;
+  const [rows] = await conn.query('SELECT id, name, payload FROM settings WHERE name = ?', ['ose']);
+  for (const row of rows) {
+    const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+    const added = [];
+    for (const [key, value] of Object.entries(defaults)) {
+      if (payload[key] === undefined) { payload[key] = value; added.push(key); }
+    }
+    if (!added.length) continue;
+    await conn.query('UPDATE settings SET payload = ?, version = version + 1 WHERE id = ?',
+      [JSON.stringify(payload), row.id]);
+    console.log(`  + settings "ose": ${added.join(', ')}`);
+  }
+}
+
 async function backfillSettings(conn) {
-  const [rows] = await conn.query('SELECT id, name, payload FROM settings');
+  const [rows] = await conn.query(
+    'SELECT id, name, payload FROM settings WHERE name NOT IN (?, ?)', ['pfe', 'ose']);
   for (const row of rows) {
     const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
     const added = [];
@@ -324,6 +454,8 @@ async function main() {
     await patch(conn);
     await seed(conn);
     await backfillSettings(conn);
+    await backfillPfeSettings(conn);
+    await backfillOseSettings(conn);
 
     console.log('migrate: done');
   } finally {

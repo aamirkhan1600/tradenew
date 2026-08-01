@@ -1,0 +1,303 @@
+<%- include('partials/head', { title: 'zoption — price filter engine' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <section class="strip">
+    <div class="tile">
+      <span class="k">Engine</span>
+      <b id="intent" class="v">—</b>
+      <span class="sub" id="alive"></span>
+    </div>
+    <div class="tile">
+      <span class="k">Broker</span>
+      <b id="broker" class="v">—</b>
+    </div>
+    <div class="tile">
+      <span class="k">NIFTY</span>
+      <b id="spot" class="v">—</b>
+      <span class="sub" id="spotsub"></span>
+    </div>
+    <!-- Module 3. Higher highs and higher lows over the last N completed
+         5-second candles — a STRUCTURE rule, not a candle-shape one. -->
+    <div class="tile">
+      <span class="k">Structure</span>
+      <b id="dir" class="v">—</b>
+      <span class="sub" id="dirsub"></span>
+    </div>
+    <!-- Module 4/7. The whole strategy in two numbers. -->
+    <div class="tile">
+      <span class="k">Bullish mid</span>
+      <b id="bullmid" class="v">—</b>
+      <span class="sub">sell PE above</span>
+    </div>
+    <div class="tile">
+      <span class="k">Bearish mid</span>
+      <b id="bearmid" class="v">—</b>
+      <span class="sub">sell CE below</span>
+    </div>
+    <div class="tile wide">
+      <span class="k">Net P&amp;L today</span>
+      <b id="pnl" class="v big">—</b>
+      <span class="sub" id="pnlsub">gross — · charges —</span>
+    </div>
+  </section>
+
+  <section class="controls">
+    <button id="start" class="go">Start</button>
+    <button id="pause" class="warn">Pause entries</button>
+    <button id="stop"  class="stop">Stop</button>
+    <a class="link" href="/pfe/settings">Settings</a>
+    <span id="risknote" class="risknote"></span>
+  </section>
+
+  <!-- WHY IS NOTHING TRADING? Answered here rather than left to be inferred
+       from a flat P&L, which is the single most expensive ambiguity this
+       platform can have. -->
+  <section class="card hidden" id="blockbox">
+    <h2>Nothing is being selected <small>the most recent reason</small></h2>
+    <p id="blocked" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>Position <small id="tradesub">one at a time — doc/new.md §12</small></h2>
+    <div id="tradebox" class="legs">
+      <p class="muted">Nothing is armed. The engine waits for three agreeing 5-second index
+        candles, checks the live price against that candle's midpoint, then scans the chain for
+        a strike inside the premium band.</p>
+    </div>
+  </section>
+
+  <!-- Module 2's ranking, exposed rather than left in a log. "Why this strike"
+       is the first question of every post-mortem. -->
+  <section class="card">
+    <h2>Last scan <small id="scanwhen"></small></h2>
+    <p id="scannote" class="muted small"></p>
+    <table>
+      <thead>
+        <tr><th>Strike</th><th>Premium</th><th>Score</th><th>Premium</th><th>Spread</th>
+          <th>OI</th><th>Volume</th><th>Depth</th></tr>
+      </thead>
+      <tbody id="scanrows"><tr><td colspan="8" class="muted">No scan yet.</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Audit trail <small>every state transition of this engine</small></h2>
+    <table class="events">
+      <thead><tr><th>Time</th><th>Side</th><th>Event</th><th>Detail</th></tr></thead>
+      <tbody id="events"><tr><td colspan="4" class="muted">Waiting…</td></tr></tbody>
+    </table>
+  </section>
+
+</main>
+
+<script>
+(function () {
+  var POLL_MS = 1000;
+
+  function rupee(paise) {
+    if (paise === null || paise === undefined) return '—';
+    var v = paise / 100;
+    return (v < 0 ? '-₹' : '₹') + Math.abs(v).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  }
+  function price(paise) {
+    return (paise === null || paise === undefined) ? '—' : (paise / 100).toFixed(2);
+  }
+  // A component the broker sent nothing for renders as an em-dash, never as 0.
+  // See the header of src/pfe/scanner.js — a zero here is a lie a trader can
+  // act on.
+  function pct(v) { return (v === null || v === undefined) ? '<span class="unavail">—</span>'
+    : Math.round(v * 100) + '%'; }
+  function set(id, text) { document.getElementById(id).textContent = text; }
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  var STATE_LABEL = {
+    IDLE: 'idle',
+    ARMED: 'armed — waiting for a candle close',
+    SELL_WORKING: 'sell limit working',
+    SELL_CANCELLING: 'cancelling',
+    POSITION_OPEN: 'position open',
+    TARGET_MOVING: 'moving the target',
+    EXITING: 'exiting',
+    DONE: 'flat'
+  };
+  var DIR_LABEL = {
+    BULLISH: 'bullish', BEARISH: 'bearish', NONE: 'no trend',
+    WARMING_UP: 'warming up', NO_DATA: 'index silent'
+  };
+
+  function row(k, v) {
+    return '<span class="k">' + k + '</span><span class="v">' + v + '</span>';
+  }
+
+  function renderTrade(t) {
+    var box = document.getElementById('tradebox');
+    if (!t) {
+      box.innerHTML = '<p class="muted">Nothing is armed. The engine waits for three agreeing '
+        + '5-second index candles, checks the live price against that candle\'s midpoint, then '
+        + 'scans the chain for a strike inside the premium band.</p>';
+      return;
+    }
+    var target = (t.targetP === null && t.filledP !== null) ? 'trailing only' : price(t.targetP);
+    box.innerHTML = '<div class="leg">'
+      + '<div class="leg-h"><b>' + esc(t.symbol || (t.optionType + ' ' + t.strike)) + '</b>'
+      + '<span class="state s-' + t.state + '">' + (STATE_LABEL[t.state] || t.state) + '</span></div>'
+      + '<div class="leg-g">'
+      + row('Selection score', t.score === null ? '—' : t.score)
+      + row('Quantity', t.qty)
+      + row('Sell limit', price(t.sellP))
+      + row('Filled at', price(t.filledP))
+      + row('Target', target)
+      + row('Stop', price(t.slP))
+      + row('Best premium', price(t.trailPeakP))
+      + row('Confirmations', t.confirmations)
+      + row('Stop trails', t.trails)
+      + '</div></div>';
+  }
+
+  function renderScan(s) {
+    var body = document.getElementById('scanrows');
+    if (!s) { body.innerHTML = '<tr><td colspan="8" class="muted">No scan yet.</td></tr>'; return; }
+
+    set('scanwhen', new Date(s.tsMs).toLocaleTimeString()
+      + (s.side ? ' · ' + s.side + ' side' : ''));
+
+    var note = s.considered + ' quoted, ' + s.rejected + ' rejected';
+    if (s.chosen) note += ' · chose ' + s.chosen + ' at ' + s.score;
+    else if (s.reason) note += ' · ' + s.reason;
+    // The honest half. On a Kotak retail entitlement these are usually ALL of
+    // them, which means the strike was chosen on premium alone.
+    if (s.unavailable) {
+      note += ' — the broker sends no ' + s.unavailable + ' on this account, so those checks '
+        + 'did not run';
+    }
+    set('scannote', note);
+
+    var rows = s.candidates || [];
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="8" class="muted">Nothing cleared the filters.</td></tr>';
+      return;
+    }
+    body.innerHTML = rows.map(function (c) {
+      var p = c.parts || {};
+      return '<tr>'
+        + '<td>' + esc(c.symbol || c.strike) + '</td>'
+        + '<td>' + price(c.ltpP) + '</td>'
+        + '<td><b>' + c.score + '</b></td>'
+        + '<td>' + pct(p.premium) + '</td>'
+        + '<td>' + pct(p.spread) + '</td>'
+        + '<td>' + pct(p.oi) + '</td>'
+        + '<td>' + pct(p.volume) + '</td>'
+        + '<td>' + pct(p.liquidity) + '</td>'
+        + '</tr>';
+    }).join('');
+  }
+
+  async function tick() {
+    try {
+      var res = await fetch('/api/pfe/status');
+      var s = await res.json();
+      if (!s.ok) throw new Error(s.error || 'status failed');
+
+      set('intent', s.intent || '—');
+      // "The engine says nothing is tradable" and "the engine is not running"
+      // need completely different actions, so they are never shown the same way.
+      var alive = document.getElementById('alive');
+      if (!s.engine) {
+        alive.textContent = 'the pfe process is not running — npm run pfe';
+        alive.className = 'sub down';
+      } else if (!s.engine.live) {
+        alive.textContent = 'last heartbeat ' + Math.round(s.engine.ageMs / 1000) + 's ago';
+        alive.className = 'sub down';
+      } else {
+        alive.textContent = s.engine.mode + ' · ' + s.engine.indexBars + ' index bars';
+        alive.className = 'sub';
+      }
+
+      set('broker', s.broker.status + (s.broker.ucc ? ' · ' + s.broker.ucc : ''));
+
+      var e = s.engine || {};
+      set('spot', e.spot === null || e.spot === undefined ? '—' : Number(e.spot).toFixed(2));
+      set('spotsub', e.quoteFilter ? 'quotes: ' + e.quoteFilter : '');
+
+      var dir = document.getElementById('dir');
+      dir.textContent = DIR_LABEL[e.directionState] || e.directionState || '—';
+      dir.className = 'v ' + (e.allowPE ? 'up' : e.allowCE ? 'down' : '');
+      var allowed = [e.allowCE ? 'CE' : null, e.allowPE ? 'PE' : null].filter(Boolean).join(' + ');
+      set('dirsub', allowed ? allowed + ' may sell' : 'no side may sell');
+
+      set('bullmid', price(e.bullishMidP));
+      set('bearmid', price(e.bearishMidP));
+
+      var pnl = document.getElementById('pnl');
+      pnl.textContent = rupee(s.risk.netPnlP);
+      pnl.className = 'v big ' + (s.risk.netPnlP > 0 ? 'up' : s.risk.netPnlP < 0 ? 'down' : '');
+      set('pnlsub', 'gross ' + rupee(s.risk.grossPnlP) + ' · charges ' + rupee(s.risk.chargesP)
+        + ' · ' + s.risk.trades + ' trades (' + s.risk.wins + 'W/' + s.risk.losses + 'L)'
+        + ' · ' + s.risk.entries + ' entries of ' + (s.risk.scans || 0) + ' scans');
+
+      var note = document.getElementById('risknote');
+      note.textContent = s.risk.disabled
+        ? 'Trading disabled today — ' + (s.risk.disabledReason || 'risk limit')
+        : (s.risk.consecutiveLosses ? s.risk.consecutiveLosses + ' consecutive losses' : '');
+      note.className = 'risknote ' + (s.risk.disabled ? 'down' : '');
+
+      var blockbox = document.getElementById('blockbox');
+      if (e.blocked && !s.trade) {
+        blockbox.className = 'card';
+        set('blocked', e.blocked);
+      } else {
+        blockbox.className = 'card hidden';
+      }
+
+      renderTrade(s.trade);
+      renderScan(s.scan);
+    } catch (err) {
+      var alive2 = document.getElementById('alive');
+      alive2.textContent = err.message;
+      alive2.className = 'sub down';
+    }
+  }
+
+  var lastEventId = 0;
+  async function events() {
+    try {
+      var res = await fetch('/api/pfe/events?limit=60');
+      var out = await res.json();
+      if (!out.ok) return;
+      var body = document.getElementById('events');
+      var fresh = out.events.filter(function (x) { return x.id > lastEventId; }).reverse();
+      if (!fresh.length) return;
+      if (body.querySelector('.muted')) body.innerHTML = '';
+      fresh.forEach(function (x) {
+        lastEventId = Math.max(lastEventId, x.id);
+        var detail = x.to_state ? (x.from_state + ' → ' + x.to_state) : (x.reason || '');
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + new Date(Number(x.ts_ms)).toLocaleTimeString() + '</td>'
+          + '<td>' + esc(x.option_type || '') + '</td>'
+          + '<td><code>' + esc(String(x.kind).replace(/^PFE_/, '')) + '</code></td>'
+          + '<td>' + esc(detail) + '</td>';
+        body.prepend(tr);
+      });
+      while (body.children.length > 120) body.removeChild(body.lastChild);
+    } catch (err) { /* the next poll tries again */ }
+  }
+
+  ['start', 'pause', 'stop'].forEach(function (id) {
+    document.getElementById(id).addEventListener('click', function () {
+      fetch('/api/pfe/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+        .then(tick);
+    });
+  });
+
+  tick(); events();
+  setInterval(tick, POLL_MS);
+  setInterval(events, POLL_MS * 2);
+}());
+</script>
+
+<%- include('partials/foot') %>

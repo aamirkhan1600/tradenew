@@ -50,6 +50,33 @@ function roundToTickPaise(pricePaise, tickPaise = 5) {
   return Math.max(t, Math.round(p / t) * t);
 }
 
+// Directed tick snapping — newdoc/update.md §2.
+//
+// The Option Selling Engine prices a SELL limit at `floorToTick(close + offset)`
+// and will not use round-to-nearest for it. The reason is one-directional: a
+// round-half-up on a sell limit can place the order ABOVE the level the strategy
+// derived, which lowers the fill probability past what the specification
+// describes — the engine would be quoting a trade nobody asked for. Flooring can
+// only ever quote at or below the derived level, which is the conservative
+// direction for a seller.
+//
+// `ceilToTickPaise` is its mirror and exists so a future buy-side limit has the
+// same guarantee without anyone re-deriving the arithmetic.
+//
+// Both clamp to one tick: a price below the minimum increment is not a price the
+// exchange will accept.
+function floorToTickPaise(pricePaise, tickPaise = 5) {
+  const t = Math.max(1, Math.round(Number(tickPaise) || 5));
+  const p = Math.round(Number(pricePaise) || 0);
+  return Math.max(t, Math.floor(p / t) * t);
+}
+
+function ceilToTickPaise(pricePaise, tickPaise = 5) {
+  const t = Math.max(1, Math.round(Number(tickPaise) || 5));
+  const p = Math.round(Number(pricePaise) || 0);
+  return Math.max(t, Math.ceil(p / t) * t);
+}
+
 /* -------------------------------------------------------------- charges -- */
 
 // Charges for ONE option order, in paise. `qty` is total units (lots x lotSize).
@@ -164,7 +191,7 @@ function formatPrice(paise) {
 }
 
 module.exports = {
-  toPaise, toRupees, roundToTickPaise,
+  toPaise, toRupees, roundToTickPaise, floorToTickPaise, ceilToTickPaise,
   charges, roundTripCharges, breakevenPaise, requiredWinRate,
   shortPnl, openPnl,
   formatInr, formatPrice,

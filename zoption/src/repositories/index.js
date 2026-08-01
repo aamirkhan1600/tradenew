@@ -384,10 +384,11 @@ const orders = {
   async create(row) {
     const res = await db.query(
       `INSERT INTO orders
-         (client_ref, cycle_id, leg_id, stage, token, segment, symbol, side, order_type,
-          product, limit_price_p, qty, status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING')`,
-      [row.clientRef, row.cycleId ?? null, row.legId ?? null, row.stage,
+         (client_ref, cycle_id, leg_id, pfe_trade_id, ose_trade_id, stage, token, segment,
+          symbol, side, order_type, product, limit_price_p, qty, status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING')`,
+      [row.clientRef, row.cycleId ?? null, row.legId ?? null, row.pfeTradeId ?? null,
+        row.oseTradeId ?? null, row.stage,
         String(row.token), row.segment || 'nse_fo', row.symbol, row.side, row.orderType,
         row.product || 'NRML', row.limitPriceP || 0, row.qty]);
     return res.insertId;
@@ -474,9 +475,61 @@ const orders = {
     return db.query(sql, stage ? [legId, stage] : [legId]);
   },
 
+  // The Price-Filter Engine's equivalent of workingForLeg. Its recovery path
+  // asks the DATABASE what is live before resending anything, so this has to
+  // answer the same question for a pfe trade.
+  async workingForPfeTrade(tradeId, stage = null) {
+    const sql = stage
+      ? `SELECT * FROM orders WHERE pfe_trade_id = ? AND stage = ?
+           AND status IN ('PENDING','PLACING','WORKING','PARTIAL') ORDER BY id DESC`
+      : `SELECT * FROM orders WHERE pfe_trade_id = ?
+           AND status IN ('PENDING','PLACING','WORKING','PARTIAL') ORDER BY id DESC`;
+    return db.query(sql, stage ? [tradeId, stage] : [tradeId]);
+  },
+
   async recent(limit = 100) {
     return db.query('SELECT * FROM orders ORDER BY id DESC LIMIT ?',
       [Math.max(1, Math.trunc(limit))]);
+  },
+
+  async recentForPfe(limit = 100) {
+    return db.query(
+      'SELECT * FROM orders WHERE pfe_trade_id IS NOT NULL ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+
+  // The Option Selling Engine's equivalent. §20.6 and §12.3 both turn on it:
+  // before resending anything the engine asks the DATABASE what is live, because
+  // resending a market buy that is already working buys the short back twice and
+  // leaves the account naked LONG.
+  async workingForOseTrade(tradeId, stage = null) {
+    const sql = stage
+      ? `SELECT * FROM orders WHERE ose_trade_id = ? AND stage = ?
+           AND status IN ('PENDING','PLACING','WORKING','PARTIAL','UNKNOWN') ORDER BY id DESC`
+      : `SELECT * FROM orders WHERE ose_trade_id = ?
+           AND status IN ('PENDING','PLACING','WORKING','PARTIAL','UNKNOWN') ORDER BY id DESC`;
+    return db.query(sql, stage ? [tradeId, stage] : [tradeId]);
+  },
+
+  async forOseTrade(tradeId) {
+    return db.query('SELECT * FROM orders WHERE ose_trade_id = ? ORDER BY id ASC', [tradeId]);
+  },
+
+  async recentForOse(limit = 100) {
+    return db.query(
+      'SELECT * FROM orders WHERE ose_trade_id IS NOT NULL ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+
+  // §20.6 step 5 — "Cancel any dangling open orders tagged by this engine."
+  // Scoped by the client_ref prefix so a reconciliation can never touch an order
+  // another engine on this account is depending on.
+  async danglingForPrefix(prefix) {
+    return db.query(
+      `SELECT * FROM orders
+        WHERE client_ref LIKE ? AND status IN ('WORKING','PARTIAL','PLACING')
+        ORDER BY id ASC`,
+      [`${String(prefix).toUpperCase()}-%`]);
   },
 };
 
@@ -647,7 +700,498 @@ const locks = {
   },
 };
 
+/* ================================================= the Price-Filter Engine == */
+/* doc/new.md. Its own trade lifecycle and its own daily risk state, over the   */
+/* same instruments, orders and events tables.                                  */
+
+const pfeTrades = {
+  // Open a trade and claim the single open-trade slot in one transaction. The
+  // UNIQUE index on pfe_guard.open_key is what makes a second concurrent opener
+  // fail with a duplicate-key error rather than run two naked shorts.
+  async open(row) {
+    return db.tx(async (t) => {
+      const res = await t.query(
+        `INSERT INTO pfe_trades
+           (trade_date, underlying, expiry_date, option_type, token, symbol, strike,
+            lot_size, qty, state, spot_at_select, direction_state, select_score,
+            select_detail, settings_snapshot, armed_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW())`,
+        [row.tradeDate, row.underlying, row.expiryDate, row.optionType,
+          String(row.token), row.symbol, row.strike, row.lotSize, row.qty,
+          row.state || 'ARMED', row.spotAtSelect ?? null, row.directionState ?? null,
+          row.selectScore ?? null,
+          row.selectDetail ? JSON.stringify(row.selectDetail) : null,
+          row.settingsSnapshot ? JSON.stringify(row.settingsSnapshot) : null]);
+      const tradeId = res.insertId;
+      await t.query('INSERT INTO pfe_guard (trade_id, open_key) VALUES (?, 1)', [tradeId]);
+      return tradeId;
+    });
+  },
+
+  // Release the slot by nulling open_key. NULLs are distinct in a UNIQUE index,
+  // so any number of finished trades coexist.
+  async release(tradeId) {
+    await db.query('UPDATE pfe_guard SET open_key = NULL WHERE trade_id = ?', [tradeId]);
+  },
+
+  async live() {
+    return db.queryOne(
+      `SELECT t.* FROM pfe_trades t
+         JOIN pfe_guard g ON g.trade_id = t.id AND g.open_key = 1
+        LIMIT 1`);
+  },
+
+  async byId(id) {
+    return db.queryOne('SELECT * FROM pfe_trades WHERE id = ? LIMIT 1', [id]);
+  },
+
+  async setState(tradeId, state, patch = {}) {
+    const cols = ['state = ?'];
+    const params = [state];
+    const map = {
+      attemptSeq: 'attempt_seq', requoteCount: 'requote_count',
+      confirmations: 'confirmations', trails: 'trails',
+      entryCandleId: 'entry_candle_id',
+      sellPriceP: 'sell_price_p', filledPriceP: 'filled_price_p', filledQty: 'filled_qty',
+      targetPriceP: 'target_price_p', slPriceP: 'sl_price_p', trailPeakP: 'trail_peak_p',
+      entryVolume: 'entry_volume',
+      openedAt: 'opened_at', closedAt: 'closed_at', exitReason: 'exit_reason',
+    };
+    for (const [key, col] of Object.entries(map)) {
+      // `in`, not truthiness: an explicit null has to reach the column. A
+      // re-armed trade CLEARS its levels, and a null read as "leave it alone"
+      // would keep the previous attempt's numbers on the row.
+      if (patch[key] !== undefined) { cols.push(`${col} = ?`); params.push(patch[key]); }
+    }
+    params.push(tradeId);
+    await db.query(`UPDATE pfe_trades SET ${cols.join(', ')} WHERE id = ?`, params);
+  },
+
+  // Book the round trip and release the slot together. Doing them in one
+  // transaction is what stops a crash between the two from leaving a booked
+  // trade still holding the only position slot.
+  async close(tradeId, { exitP, grossPnlP, chargesP, netPnlP, exitReason }) {
+    await db.tx(async (t) => {
+      await t.query(
+        `UPDATE pfe_trades
+            SET exit_price_p = ?, gross_pnl_p = ?, charges_p = ?, net_pnl_p = ?,
+                exit_reason = ?, state = 'DONE', closed_at = NOW()
+          WHERE id = ?`,
+        [exitP ?? null, grossPnlP ?? null, chargesP ?? null, netPnlP ?? null,
+          String(exitReason || '').slice(0, 32), tradeId]);
+      await t.query('UPDATE pfe_guard SET open_key = NULL WHERE trade_id = ?', [tradeId]);
+    });
+  },
+
+  async forDate(tradeDate, limit = 200) {
+    return db.query(
+      'SELECT * FROM pfe_trades WHERE trade_date = ? ORDER BY id DESC LIMIT ?',
+      [tradeDate, Math.max(1, Math.trunc(limit))]);
+  },
+
+  async recent(limit = 100) {
+    return db.query('SELECT * FROM pfe_trades ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+
+  async countEntriesForDate(tradeDate) {
+    const row = await db.queryOne(
+      'SELECT COUNT(*) AS n FROM pfe_trades WHERE trade_date = ? AND filled_price_p IS NOT NULL',
+      [tradeDate]);
+    return row.n;
+  },
+};
+
+const pfeScans = {
+  async log(row) {
+    await db.query(
+      `INSERT INTO pfe_scans
+         (trade_date, ts_ms, underlying, expiry_date, side, spot, direction_state,
+          chosen_token, chosen_symbol, chosen_score, considered, rejected, unavailable,
+          candidates, reason)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [row.tradeDate, row.tsMs ?? Date.now(), row.underlying, row.expiryDate ?? null,
+        row.side ?? null, row.spot ?? null, row.directionState ?? null,
+        row.chosenToken ?? null, row.chosenSymbol ?? null, row.chosenScore ?? null,
+        row.considered ?? 0, row.rejected ?? 0,
+        row.unavailable ? String(row.unavailable.join(', ')).slice(0, 255) : null,
+        row.candidates ? JSON.stringify(row.candidates) : null,
+        row.reason == null ? null : String(row.reason).slice(0, 255)]);
+  },
+
+  async recent(limit = 50) {
+    return db.query('SELECT * FROM pfe_scans ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+
+  async latest() {
+    return db.queryOne('SELECT * FROM pfe_scans ORDER BY id DESC LIMIT 1');
+  },
+
+  async purgeOlderThan(days) {
+    const res = await db.query(
+      'DELETE FROM pfe_scans WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
+      [Math.max(1, Math.trunc(days))]);
+    return res.affectedRows || 0;
+  },
+};
+
+const pfeStats = {
+  async ensure(tradeDate) {
+    await db.query(
+      'INSERT INTO pfe_stats (trade_date) VALUES (?) ON DUPLICATE KEY UPDATE trade_date = trade_date',
+      [tradeDate]);
+    return pfeStats.get(tradeDate);
+  },
+
+  async get(tradeDate) {
+    return db.queryOne('SELECT * FROM pfe_stats WHERE trade_date = ? LIMIT 1', [tradeDate]);
+  },
+
+  // Fold one closed round trip into the day. Consecutive losses reset on any
+  // non-losing trade — a scratch is not a loss, and treating it as one would
+  // trip the cooldown on a flat day.
+  async recordTrade(tradeDate, { grossPnlP, chargesP, netPnlP }) {
+    const isLoss = netPnlP < 0;
+    await db.query(
+      `INSERT INTO pfe_stats
+         (trade_date, realized_pnl_p, gross_pnl_p, charges_p, trade_count,
+          win_count, loss_count, consecutive_losses)
+       VALUES (?,?,?,?,1,?,?,?)
+       ON DUPLICATE KEY UPDATE
+         realized_pnl_p = realized_pnl_p + VALUES(realized_pnl_p),
+         gross_pnl_p    = gross_pnl_p + VALUES(gross_pnl_p),
+         charges_p      = charges_p + VALUES(charges_p),
+         trade_count    = trade_count + 1,
+         win_count      = win_count + VALUES(win_count),
+         loss_count     = loss_count + VALUES(loss_count),
+         consecutive_losses = IF(VALUES(loss_count) = 1, consecutive_losses + 1, 0)`,
+      [tradeDate, netPnlP, grossPnlP, chargesP, isLoss ? 0 : 1, isLoss ? 1 : 0, isLoss ? 1 : 0]);
+    return pfeStats.get(tradeDate);
+  },
+
+  async bumpEntry(tradeDate) {
+    await db.query(
+      `INSERT INTO pfe_stats (trade_date, entry_count) VALUES (?, 1)
+       ON DUPLICATE KEY UPDATE entry_count = entry_count + 1`, [tradeDate]);
+  },
+
+  async bumpScan(tradeDate) {
+    await db.query(
+      `INSERT INTO pfe_stats (trade_date, scan_count) VALUES (?, 1)
+       ON DUPLICATE KEY UPDATE scan_count = scan_count + 1`, [tradeDate]);
+  },
+
+  async setCooldown(tradeDate, untilMs) {
+    await db.query(
+      `INSERT INTO pfe_stats (trade_date, cooldown_until) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE cooldown_until = VALUES(cooldown_until)`,
+      [tradeDate, time.toMysql(untilMs)]);
+  },
+
+  async disable(tradeDate, reason) {
+    await db.query(
+      `INSERT INTO pfe_stats (trade_date, disabled, disabled_reason) VALUES (?, 1, ?)
+       ON DUPLICATE KEY UPDATE disabled = 1, disabled_reason = VALUES(disabled_reason)`,
+      [tradeDate, String(reason || '').slice(0, 64)]);
+  },
+};
+
+/* ============================================ the Option Selling Engine == */
+/* newdoc/update.md §19. Audit trail, crash recovery and risk-counter          */
+/* durability — NOT hot-path decision data. Only three of these writes block   */
+/* the engine (§19.2): oseTrades.open, oseTrades.close and every oseStats      */
+/* mutation. Everything else is called fire-and-forget.                        */
+
+const oseTrades = {
+  // §19.2 write #1 — SYNCHRONOUS, and it happens BEFORE the entry order is
+  // placed. "If this write fails, no order is placed. This guarantees no
+  // position can exist without a durable record."
+  //
+  // The insert and the §3.3 slot claim are one transaction, so a crash between
+  // them cannot leave a trade holding a slot it never got or a slot held by a
+  // trade that does not exist.
+  async open(row) {
+    return db.tx(async (t) => {
+      const res = await t.query(
+        `INSERT INTO ose_trades
+           (trade_uid, trade_date, underlying, expiry_date, option_type, token, symbol,
+            strike, lot_size, qty, state, entry_trend, requested_price_p,
+            entry_candle_ts, entry_candle_id, target_level, target_price_p, stop_price_p,
+            select_score, select_detail, settings_snapshot, status)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'OPEN')`,
+        [row.tradeUid, row.tradeDate, row.underlying, row.expiryDate, row.optionType,
+          String(row.token), row.symbol, row.strike, row.lotSize, row.qty,
+          row.state || 'ORDER_PENDING', row.entryTrend, row.requestedPriceP,
+          row.entryCandleTs ?? null, row.entryCandleId ?? null,
+          row.targetLevel ?? 0, row.targetPriceP ?? null, row.stopPriceP ?? null,
+          row.selectScore ?? null,
+          row.selectDetail ? JSON.stringify(row.selectDetail) : null,
+          row.settingsSnapshot ? JSON.stringify(row.settingsSnapshot) : null]);
+      const tradeId = res.insertId;
+      await t.query('INSERT INTO ose_guard (trade_id, open_key) VALUES (?, 1)', [tradeId]);
+      return tradeId;
+    });
+  },
+
+  // Give the single-position slot back without booking anything. Used when a
+  // trade is abandoned before it ever filled — nothing to close, but the slot
+  // must not stay held.
+  async release(tradeId) {
+    await db.query('UPDATE ose_guard SET open_key = NULL WHERE trade_id = ?', [tradeId]);
+  },
+
+  async live() {
+    return db.queryOne(
+      `SELECT t.* FROM ose_trades t
+         JOIN ose_guard g ON g.trade_id = t.id AND g.open_key = 1
+        LIMIT 1`);
+  },
+
+  // §20.6 step 2 — every trade the database still calls open, whether or not it
+  // holds the slot. The reconciliation reads this rather than `live()` so a row
+  // orphaned by a crash between the insert and the guard is still found.
+  async openTrades() {
+    return db.query("SELECT * FROM ose_trades WHERE status = 'OPEN' ORDER BY id ASC");
+  },
+
+  async byId(id) {
+    return db.queryOne('SELECT * FROM ose_trades WHERE id = ? LIMIT 1', [id]);
+  },
+
+  async byUid(uid) {
+    return db.queryOne('SELECT * FROM ose_trades WHERE trade_uid = ? LIMIT 1', [String(uid)]);
+  },
+
+  async setState(tradeId, state, patch = {}) {
+    const cols = ['state = ?'];
+    const params = [state];
+    const map = {
+      entryPriceP: 'entry_price_p', entryTs: 'entry_ts', entryCandleId: 'entry_candle_id',
+      filledQty: 'filled_qty',
+      targetLevel: 'target_level', targetPriceP: 'target_price_p',
+      stopPriceP: 'stop_price_p', candlesHeld: 'candles_held', mfePoints: 'mfe_points',
+      exitReason: 'exit_reason', exitAttempts: 'exit_attempts',
+    };
+    for (const [key, col] of Object.entries(map)) {
+      // `in`, not truthiness: an explicit null has to reach the column.
+      if (patch[key] !== undefined) { cols.push(`${col} = ?`); params.push(patch[key]); }
+    }
+    params.push(tradeId);
+    await db.query(`UPDATE ose_trades SET ${cols.join(', ')} WHERE id = ?`, params);
+  },
+
+  // §19.2 write #2 — SYNCHRONOUS, after the exit fill. Booking the round trip
+  // and releasing the slot are one transaction: a crash between them would leave
+  // a booked trade still holding the only position slot, and the next boot would
+  // refuse to trade for a reason nobody could see.
+  async close(tradeId, {
+    exitP, exitTs, grossPnlP, chargesP, netPnlP, exitReason, finalStopP, candlesHeld, mfePoints,
+  }) {
+    await db.tx(async (t) => {
+      await t.query(
+        `UPDATE ose_trades
+            SET exit_price_p = ?, exit_ts = ?, gross_pnl_p = ?, charges_p = ?, net_pnl_p = ?,
+                exit_reason = ?, final_stop_p = ?, candles_held = ?, mfe_points = ?,
+                state = 'COOLDOWN', status = 'CLOSED'
+          WHERE id = ?`,
+        [exitP ?? null, exitTs ?? null, grossPnlP ?? null, chargesP ?? null, netPnlP ?? null,
+          String(exitReason || '').slice(0, 48), finalStopP ?? null,
+          candlesHeld ?? 0, mfePoints ?? 0, tradeId]);
+      await t.query('UPDATE ose_guard SET open_key = NULL WHERE trade_id = ?', [tradeId]);
+    });
+  },
+
+  // §20.6 case (c) and the ERROR status. A trade the engine cannot account for
+  // is marked and the slot is deliberately NOT released — the halt is supposed
+  // to stop the next session too.
+  async markError(tradeId, reason) {
+    await db.query(
+      `UPDATE ose_trades SET status = 'ERROR', exit_reason = ? WHERE id = ?`,
+      [String(reason || '').slice(0, 48), tradeId]);
+  },
+
+  async forDate(tradeDate, limit = 200) {
+    return db.query(
+      'SELECT * FROM ose_trades WHERE trade_date = ? ORDER BY id DESC LIMIT ?',
+      [tradeDate, Math.max(1, Math.trunc(limit))]);
+  },
+
+  async recent(limit = 100) {
+    return db.query('SELECT * FROM ose_trades ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+};
+
+const oseDecisions = {
+  // ~4,300 rows a session, so this is on the async path and never awaited by a
+  // decision cycle. `ON DUPLICATE KEY UPDATE id = id` makes a replayed candle
+  // idempotent: the decision for a given (date, candle) is written once and
+  // never revised.
+  async log(row) {
+    await db.query(
+      `INSERT INTO ose_decisions
+         (cycle_id, trade_date, candle_ts, nifty_open_p, nifty_high_p, nifty_low_p,
+          nifty_close_p, synthetic, low_confidence, tick_count,
+          trend, trend_via, bullish_mid_p, bearish_mid_p,
+          outcome, detail, selected_symbol, selection_score, state, latency_ms)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE id = id`,
+      [row.cycleId, row.tradeDate, row.candleTs,
+        row.openP, row.highP, row.lowP, row.closeP, row.synthetic ? 1 : 0,
+        row.lowConfidence ? 1 : 0, row.tickCount ?? 0,
+        row.trend || 'NONE', row.trendVia ?? null,
+        row.bullishMidP ?? null, row.bearishMidP ?? null,
+        String(row.outcome).slice(0, 48),
+        row.detail == null ? null : String(row.detail).slice(0, 255),
+        row.selectedSymbol ?? null, row.selectionScore ?? null,
+        row.state ?? null, row.latencyMs ?? 0]);
+  },
+
+  async recent(limit = 200) {
+    return db.query('SELECT * FROM ose_decisions ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+
+  async forDate(tradeDate, limit = 5000) {
+    return db.query(
+      'SELECT * FROM ose_decisions WHERE trade_date = ? ORDER BY candle_ts ASC LIMIT ?',
+      [tradeDate, Math.max(1, Math.trunc(limit))]);
+  },
+
+  // The question §21 exists to answer: what did the engine spend the session
+  // refusing, and how often. One query rather than a log grep.
+  async outcomeTally(tradeDate) {
+    return db.query(
+      `SELECT outcome, COUNT(*) AS n, MAX(id) AS last_id
+         FROM ose_decisions WHERE trade_date = ?
+        GROUP BY outcome ORDER BY n DESC`, [tradeDate]);
+  },
+
+  // §23.1 — the latency budget, measured. p99 is approximated by ordering rather
+  // than by a window function, so this works on MariaDB too.
+  async latency(tradeDate) {
+    return db.queryOne(
+      `SELECT COUNT(*) AS n, AVG(latency_ms) AS avg_ms, MAX(latency_ms) AS max_ms
+         FROM ose_decisions WHERE trade_date = ?`, [tradeDate]);
+  },
+
+  async purgeOlderThan(days) {
+    const res = await db.query(
+      'DELETE FROM ose_decisions WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
+      [Math.max(1, Math.trunc(days))]);
+    return res.affectedRows || 0;
+  },
+};
+
+const oseTransitions = {
+  async log(row) {
+    await db.query(
+      `INSERT INTO ose_transitions
+         (cycle_id, trade_uid, from_state, to_state, trigger_event, reason, illegal, ts_ms)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [row.cycleId ?? null, row.tradeUid ?? null, row.fromState, row.toState,
+        String(row.trigger || '').slice(0, 48),
+        row.reason == null ? null : String(row.reason).slice(0, 256),
+        row.illegal ? 1 : 0, row.tsMs ?? Date.now()]);
+  },
+
+  async recent(limit = 200) {
+    return db.query('SELECT * FROM ose_transitions ORDER BY id DESC LIMIT ?',
+      [Math.max(1, Math.trunc(limit))]);
+  },
+
+  async purgeOlderThan(days) {
+    const res = await db.query(
+      'DELETE FROM ose_transitions WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
+      [Math.max(1, Math.trunc(days))]);
+    return res.affectedRows || 0;
+  },
+};
+
+const oseStats = {
+  async ensure(tradeDate) {
+    await db.query(
+      'INSERT INTO ose_stats (trade_date) VALUES (?) ON DUPLICATE KEY UPDATE trade_date = trade_date',
+      [tradeDate]);
+    return oseStats.get(tradeDate);
+  },
+
+  async get(tradeDate) {
+    return db.queryOne('SELECT * FROM ose_stats WHERE trade_date = ? LIMIT 1', [tradeDate]);
+  },
+
+  // §19.2 write #3 — SYNCHRONOUS. The counters must be durable before the engine
+  // acts on them, or a crash turns a tripped circuit breaker back into a fresh
+  // day's allowance.
+  //
+  // §17.3: a loss is NET P&L below zero. Exactly zero is a SCRATCH — it resets
+  // the consecutive-loss counter (it is not a loss) but is counted separately
+  // from a win, because a day of scratches is a day the strategy did nothing and
+  // a win rate that hides them is a win rate that lies.
+  async recordTrade(tradeDate, { grossPnlP, chargesP, netPnlP }) {
+    const isLoss = netPnlP < 0;
+    const isWin = netPnlP > 0;
+    await db.query(
+      `INSERT INTO ose_stats
+         (trade_date, trades_today, realised_pnl_p, gross_pnl_p, charges_p,
+          win_count, loss_count, scratch_count, consecutive_losses)
+       VALUES (?,1,?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE
+         trades_today   = trades_today + 1,
+         realised_pnl_p = realised_pnl_p + VALUES(realised_pnl_p),
+         gross_pnl_p    = gross_pnl_p + VALUES(gross_pnl_p),
+         charges_p      = charges_p + VALUES(charges_p),
+         win_count      = win_count + VALUES(win_count),
+         loss_count     = loss_count + VALUES(loss_count),
+         scratch_count  = scratch_count + VALUES(scratch_count),
+         consecutive_losses = IF(VALUES(loss_count) = 1, consecutive_losses + 1, 0)`,
+      [tradeDate, netPnlP, grossPnlP, chargesP,
+        isWin ? 1 : 0, isLoss ? 1 : 0, (!isWin && !isLoss) ? 1 : 0, isLoss ? 1 : 0]);
+    return oseStats.get(tradeDate);
+  },
+
+  async bumpCycle(tradeDate) {
+    await db.query(
+      `INSERT INTO ose_stats (trade_date, cycles) VALUES (?, 1)
+       ON DUPLICATE KEY UPDATE cycles = cycles + 1`, [tradeDate]);
+  },
+
+  async bumpEntry(tradeDate) {
+    await db.query(
+      `INSERT INTO ose_stats (trade_date, entries) VALUES (?, 1)
+       ON DUPLICATE KEY UPDATE entries = entries + 1`, [tradeDate]);
+  },
+
+  // §17.6 — terminal for the session. Written once and never rewritten: a halt
+  // reason that keeps being overwritten by later symptoms loses the first cause,
+  // which is the one an operator needs.
+  async halt(tradeDate, reason) {
+    await db.query(
+      `INSERT INTO ose_stats (trade_date, halted, halt_reason, halted_at)
+       VALUES (?, 1, ?, NOW())
+       ON DUPLICATE KEY UPDATE
+         halt_reason = IF(halted = 1, halt_reason, VALUES(halt_reason)),
+         halted_at   = IF(halted = 1, halted_at, NOW()),
+         halted      = 1`,
+      [tradeDate, String(reason || '').slice(0, 256)]);
+  },
+
+  // §26.6 — the ONLY path that clears a halt, and it is reachable only from
+  // scripts/ose-reset-halt.js. There is deliberately no API route and no
+  // automatic path: §17.6 requires an operator to confirm flat at the broker
+  // terminal first, which no code here can verify.
+  async clearHalt(tradeDate) {
+    const res = await db.query(
+      `UPDATE ose_stats SET halted = 0, halt_reason = NULL, halted_at = NULL
+        WHERE trade_date = ? AND halted = 1`, [tradeDate]);
+    return (res.affectedRows || 0) > 0;
+  },
+};
+
 module.exports = {
   settings, flags, instruments, broker, cycles, legs, candles,
   orders, positions, stats, events, locks,
+  pfeTrades, pfeScans, pfeStats,
+  oseTrades, oseDecisions, oseTransitions, oseStats,
 };

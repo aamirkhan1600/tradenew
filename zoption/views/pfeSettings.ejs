@@ -1,0 +1,328 @@
+<%- include('partials/head', { title: 'zoption — price filter settings' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <% if (warnings && warnings.length) { %>
+    <section class="card warnbox">
+      <h2>Worth a look <small>legal settings that are probably not what you meant</small></h2>
+      <ul><% warnings.forEach(function (w) { %><li><%= w %></li><% }); %></ul>
+    </section>
+  <% } %>
+
+  <!-- The number that decides whether this configuration can make money, shown
+       before any of the inputs. Both rungs, because quoting only the first would
+       understate the strategy and quoting only the last would flatter it. -->
+  <section class="card">
+    <h2>What this configuration needs to break even
+      <small>charges are paid in full on winners and losers alike</small></h2>
+    <dl class="kv">
+      <dt>Quantity</dt><dd><%= note.qty %> (<%= settings.lots %> lot)</dd>
+      <dt>Round-trip charges</dt><dd><%= money.formatInr(note.chargesP) %></dd>
+      <dt>Break-even move</dt><dd>₹<%= (note.breakevenPointsP / 100).toFixed(2) %> of premium</dd>
+      <dt>First rung (₹<%= settings.target %>)</dt>
+      <dd>
+        <% if (note.requiredWinRate === null) { %>
+          <span class="down">a win loses money at this size</span>
+        <% } else { %>
+          needs a <b class="<%= note.requiredWinRate >= 0.6 ? 'down' : '' %>"><%= (note.requiredWinRate * 100).toFixed(0) %>%</b>
+          win rate · win <%= money.formatInr(note.winP) %>, loss <%= money.formatInr(note.lossP) %>
+        <% } %>
+      </dd>
+      <dt>Full ladder (₹<%= (note.ladderTargetP / 100).toFixed(2) %>)</dt>
+      <dd>
+        <% if (note.ladderRequiredWinRate === null) { %>
+          <span class="down">still loses money at this size</span>
+        <% } else { %>
+          needs a <b><%= (note.ladderRequiredWinRate * 100).toFixed(0) %>%</b> win rate ·
+          win <%= money.formatInr(note.ladderWinP) %>
+        <% } %>
+      </dd>
+    </dl>
+  </section>
+
+  <form class="card" id="form">
+    <h2>Contract <small>saved between trades only — the engine snapshots settings when it selects</small></h2>
+    <div class="grid">
+      <label>Symbol
+        <input name="symbol" value="<%= settings.symbol %>" readonly>
+      </label>
+      <label>Expiry mode
+        <select name="expiryMode">
+          <% ['CURRENT_WEEKLY','NEXT_WEEKLY','MONTHLY','MANUAL'].forEach(function (m) { %>
+            <option value="<%= m %>" <%= settings.expiryMode === m ? 'selected' : '' %>><%= m %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Sides allowed <span class="hint">the trend filter narrows this further</span>
+        <select name="tradeMode">
+          <% ['BOTH','CE','PE'].forEach(function (m) { %>
+            <option value="<%= m %>" <%= settings.tradeMode === m ? 'selected' : '' %>><%= m %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Lots
+        <input name="lots" type="number" step="1" min="1" value="<%= settings.lots %>">
+      </label>
+      <label>Execution
+        <select name="mode">
+          <option value="PAPER" <%= settings.mode === 'PAPER' ? 'selected' : '' %>>PAPER — simulated against the live tick stream</option>
+          <option value="LIVE"  <%= settings.mode === 'LIVE'  ? 'selected' : '' %>>LIVE — orders reach the exchange</option>
+        </select>
+      </label>
+    </div>
+
+    <h2>Module 1 — session <small>09:16 start, 15:10 last entry, 15:20 force exit</small></h2>
+    <div class="grid">
+      <label>Start (IST)<input name="sessionStart" value="<%= settings.sessionStart %>"></label>
+      <label>Last entry (IST)<input name="lastEntryAt" value="<%= settings.lastEntryAt %>"></label>
+      <label>Force exit (IST)<input name="squareOffAt" value="<%= settings.squareOffAt %>"></label>
+    </div>
+
+    <h2>Module 2 — premium selection
+      <small>the band a sellable contract has to sit in</small>
+    </h2>
+    <div class="grid">
+      <label>Accept from ₹
+        <input name="premiumMin" type="number" step="0.5" value="<%= settings.premiumMin %>">
+      </label>
+      <label>…to ₹
+        <input name="premiumMax" type="number" step="0.5" value="<%= settings.premiumMax %>">
+      </label>
+      <label>Ideal from ₹ <span class="hint">scores full marks</span>
+        <input name="premiumIdealMin" type="number" step="0.5" value="<%= settings.premiumIdealMin %>">
+      </label>
+      <label>…to ₹
+        <input name="premiumIdealMax" type="number" step="0.5" value="<%= settings.premiumIdealMax %>">
+      </label>
+      <label>Strikes each side of ATM to quote
+        <input name="scanRange" type="number" step="1" min="1" max="40" value="<%= settings.scanRange %>">
+      </label>
+      <label>Re-scan every (s)
+        <input name="scanIntervalSec" type="number" step="1" min="1" value="<%= settings.scanIntervalSec %>">
+      </label>
+    </div>
+
+    <h2>Module 2 — liquidity
+      <small>Kotak's retail quote filter sends none of these on most accounts — read the mode carefully</small>
+    </h2>
+    <div class="grid">
+      <label>When the broker sends no such field
+        <select name="liquidityMode">
+          <option value="LENIENT" <%= settings.liquidityMode === 'LENIENT' ? 'selected' : '' %>>LENIENT — skip that check and record it</option>
+          <option value="STRICT"  <%= settings.liquidityMode === 'STRICT'  ? 'selected' : '' %>>STRICT — treat it as a failure (may never select anything)</option>
+        </select>
+      </label>
+      <label>Minimum open interest
+        <input name="minOpenInterest" type="number" step="1000" min="0" value="<%= settings.minOpenInterest %>">
+      </label>
+      <label>Minimum volume
+        <input name="minVolume" type="number" step="1000" min="0" value="<%= settings.minVolume %>">
+      </label>
+      <label>Minimum bid quantity
+        <input name="minBidQty" type="number" step="25" min="0" value="<%= settings.minBidQty %>">
+      </label>
+      <label>Minimum ask quantity
+        <input name="minAskQty" type="number" step="25" min="0" value="<%= settings.minAskQty %>">
+      </label>
+      <label>Maximum spread ₹
+        <input name="maxSpread" type="number" step="0.05" min="0" value="<%= settings.maxSpread %>">
+      </label>
+    </div>
+
+    <h2>Module 2 — ranking weights
+      <small>a term the broker sends no data for is dropped and the score rescaled; 0 removes it</small>
+    </h2>
+    <div class="grid">
+      <label>Premium<input name="weightPremium" type="number" step="0.5" min="0" max="10" value="<%= settings.weightPremium %>"></label>
+      <label>Spread<input name="weightSpread" type="number" step="0.5" min="0" max="10" value="<%= settings.weightSpread %>"></label>
+      <label>Open interest<input name="weightOi" type="number" step="0.5" min="0" max="10" value="<%= settings.weightOi %>"></label>
+      <label>Volume<input name="weightVolume" type="number" step="0.5" min="0" max="10" value="<%= settings.weightVolume %>"></label>
+      <label>Depth at the touch<input name="weightDepth" type="number" step="0.5" min="0" max="10" value="<%= settings.weightDepth %>"></label>
+    </div>
+
+    <h2>Module 3 — trend direction
+      <small>higher highs and higher lows across N completed index candles</small>
+    </h2>
+    <div class="grid">
+      <label>Index timeframe
+        <select name="trendTimeframe">
+          <% ['5s','15s','30s','1m','3m','5m'].forEach(function (t) { %>
+            <option value="<%= t %>" <%= settings.trendTimeframe === t ? 'selected' : '' %>><%= t %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Candles that must agree
+        <input name="trendBars" type="number" step="1" min="2" max="10" value="<%= settings.trendBars %>">
+      </label>
+      <label>Close direction rule
+        <select name="trendCloseRule">
+          <option value="LAST" <%= settings.trendCloseRule === 'LAST' ? 'selected' : '' %>>LAST — only the newest candle must close with the trend</option>
+          <option value="ALL"  <%= settings.trendCloseRule === 'ALL'  ? 'selected' : '' %>>ALL — every candle must (stricter, far fewer signals)</option>
+          <option value="OFF"  <%= settings.trendCloseRule === 'OFF'  ? 'selected' : '' %>>OFF — structure alone</option>
+        </select>
+      </label>
+      <label>Minimum ticks per index bar <span class="hint">fewer = the bar measured nothing</span>
+        <input name="trendMinTicks" type="number" step="1" min="0" value="<%= settings.trendMinTicks %>">
+      </label>
+    </div>
+
+    <h2>Modules 4 &amp; 5 — entry
+      <small>the sell price is always the option contract's own closed candle plus the offset</small>
+    </h2>
+    <div class="grid">
+      <label>Option timeframe
+        <select name="optionTimeframe">
+          <% ['5s','15s','30s','1m','3m','5m'].forEach(function (t) { %>
+            <option value="<%= t %>" <%= settings.optionTimeframe === t ? 'selected' : '' %>><%= t %></option>
+          <% }); %>
+        </select>
+      </label>
+      <label>Minimum ticks per option bar
+        <input name="optionMinTicks" type="number" step="1" min="0" value="<%= settings.optionMinTicks %>">
+      </label>
+      <label>Sell offset ₹ <span class="hint">added to the close</span>
+        <input name="sellOffset" type="number" step="0.05" min="0" value="<%= settings.sellOffset %>">
+      </label>
+      <label>Cancel an unfilled limit after (s)
+        <input name="pendingTimeout" type="number" step="1" min="1" value="<%= settings.pendingTimeout %>">
+      </label>
+      <label>Release an unsold strike after (s) <span class="hint">0 = hold it until the square-off</span>
+        <input name="armTimeout" type="number" step="10" min="0" value="<%= settings.armTimeout %>">
+      </label>
+    </div>
+
+    <h2>Modules 6 &amp; 8 — target and ladder</h2>
+    <div class="grid">
+      <label>Initial target ₹
+        <input name="target" type="number" step="0.05" value="<%= settings.target %>">
+      </label>
+      <label>Initial stop ₹
+        <input name="stopLoss" type="number" step="0.05" value="<%= settings.stopLoss %>">
+      </label>
+      <label>Dynamic target
+        <select name="dynamicTarget">
+          <option value="true"  <%= settings.dynamicTarget ? 'selected' : '' %>>ON — extend the target on every confirmation</option>
+          <option value="false" <%= settings.dynamicTarget ? '' : 'selected' %>>OFF — take one point and stop</option>
+        </select>
+      </label>
+      <label>Step per confirmation ₹
+        <input name="targetStep" type="number" step="0.05" value="<%= settings.targetStep %>">
+      </label>
+      <label>Confirmations before trail-only
+        <input name="maxTargetSteps" type="number" step="1" min="1" max="20" value="<%= settings.maxTargetSteps %>">
+      </label>
+    </div>
+
+    <h2>Module 9 — trailing stop
+      <small>the stop never moves backward; the gap tightens as the trade runs</small>
+    </h2>
+    <div class="grid">
+      <label>Trail starts after ₹ of profit <span class="hint">0 = from the first tick</span>
+        <input name="trailStart" type="number" step="0.05" min="0" value="<%= settings.trailStart %>">
+      </label>
+      <label>Starting gap ₹ <span class="hint">stop sits this far above the best premium; 0 = no trail</span>
+        <input name="trailGap" type="number" step="0.05" min="0" value="<%= settings.trailGap %>">
+      </label>
+      <label>Tighten by ₹ per trail <span class="hint">0 = fixed gap</span>
+        <input name="trailTighten" type="number" step="0.05" min="0" value="<%= settings.trailTighten %>">
+      </label>
+      <label>Minimum gap ₹
+        <input name="trailMinGap" type="number" step="0.05" min="0" value="<%= settings.trailMinGap %>">
+      </label>
+    </div>
+
+    <h2>Module 10 — exits</h2>
+    <div class="grid">
+      <label>Maximum hold (s) <span class="hint">the document asks for 60–90</span>
+        <input name="maxHoldSeconds" type="number" step="5" min="1" value="<%= settings.maxHoldSeconds %>">
+      </label>
+      <label>Premium safety exit ₹ <span class="hint">out even if nothing else has failed</span>
+        <input name="premiumSafetyExit" type="number" step="0.05" min="0" value="<%= settings.premiumSafetyExit %>">
+      </label>
+      <label>Exit when the price position filter fails
+        <select name="exitOnFilterFail">
+          <option value="true"  <%= settings.exitOnFilterFail ? 'selected' : '' %>>ON</option>
+          <option value="false" <%= settings.exitOnFilterFail ? '' : 'selected' %>>OFF</option>
+        </select>
+      </label>
+      <label>Exit when the trend structure breaks
+        <select name="exitOnTrendBreak">
+          <option value="true"  <%= settings.exitOnTrendBreak ? 'selected' : '' %>>ON</option>
+          <option value="false" <%= settings.exitOnTrendBreak ? '' : 'selected' %>>OFF</option>
+        </select>
+      </label>
+      <label>Exit when liquidity goes
+        <select name="exitOnLiquidity">
+          <option value="true"  <%= settings.exitOnLiquidity ? 'selected' : '' %>>ON — needs a broker that sends a book</option>
+          <option value="false" <%= settings.exitOnLiquidity ? '' : 'selected' %>>OFF</option>
+        </select>
+      </label>
+      <label>…at a spread wider than ₹
+        <input name="liquidityExitSpread" type="number" step="0.05" min="0" value="<%= settings.liquidityExitSpread %>">
+      </label>
+    </div>
+
+    <h2>Modules 11 &amp; 12 — re-entry and risk</h2>
+    <div class="grid">
+      <label>Wait this many candles after an exit
+        <input name="reentryCandles" type="number" step="1" min="0" value="<%= settings.reentryCandles %>">
+      </label>
+      <label>Maximum trades per day <span class="hint">0 = unlimited</span>
+        <input name="maxTradesPerDay" type="number" step="1" min="0" value="<%= settings.maxTradesPerDay %>">
+      </label>
+      <label>Maximum consecutive losses
+        <input name="maxConsecutiveLosses" type="number" step="1" min="0" value="<%= settings.maxConsecutiveLosses %>">
+      </label>
+      <label>Cooldown after a stop (s)
+        <input name="cooldownAfterSL" type="number" step="10" min="0" value="<%= settings.cooldownAfterSL %>">
+      </label>
+      <label>Daily loss limit ₹
+        <input name="maxDailyLoss" type="number" step="100" min="0" value="<%= settings.maxDailyLoss %>">
+      </label>
+      <label>Daily profit target ₹
+        <input name="maxDailyProfit" type="number" step="100" min="0" value="<%= settings.maxDailyProfit %>">
+      </label>
+      <div class="tile">
+        <span class="k">Simultaneous positions</span>
+        <b class="v">1</b>
+        <span class="sub">enforced by the database, not configurable</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="go">Save</button>
+      <a class="link" href="/pfe">Back to the engine</a>
+      <span id="msg" class="msg"></span>
+    </div>
+  </form>
+
+</main>
+
+<script>
+document.getElementById('form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var data = Object.fromEntries(new FormData(e.target).entries());
+  var msg = document.getElementById('msg');
+  msg.textContent = 'Saving…';
+  msg.className = 'msg';
+  try {
+    var res = await fetch('/api/pfe/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    var out = await res.json();
+    if (!out.ok) throw new Error(out.error || 'rejected');
+    msg.textContent = out.warnings && out.warnings.length
+      ? 'Saved with ' + out.warnings.length + ' warning(s) — reload to read them.'
+      : 'Saved.';
+    msg.className = 'msg ok';
+  } catch (err) {
+    msg.textContent = err.message;
+    msg.className = 'msg bad';
+  }
+});
+</script>
+
+<%- include('partials/foot') %>

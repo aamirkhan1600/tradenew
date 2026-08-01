@@ -184,6 +184,16 @@ CREATE TABLE IF NOT EXISTS orders (
   client_ref      VARCHAR(64) NOT NULL,
   cycle_id        INT UNSIGNED NULL,
   leg_id          INT UNSIGNED NULL,
+  -- The Price-Filter Engine's orders link here instead of to cycle/leg. Exactly
+  -- one of (leg_id, pfe_trade_id) is set on any given row, and the client_ref
+  -- prefix says which engine owns it: `zo-` for the scalper, `pf-` for the PFE.
+  -- One orders table means one idempotency key, one reconciler and one place to
+  -- read when the question is "what did this account send today".
+  pfe_trade_id    INT UNSIGNED NULL,
+  -- The Option Selling Engine's orders (newdoc/update.md) link here. Exactly one
+  -- of (leg_id, pfe_trade_id, ose_trade_id) is set on any row, and the
+  -- client_ref prefix says which engine owns it: `zo-`, `pf-` or `os-`.
+  ose_trade_id    INT UNSIGNED NULL,
   stage           VARCHAR(24) NOT NULL,           -- ENTRY / TARGET / SL / TIMEOUT / SQUAREOFF
   broker_order_id VARCHAR(48) NULL,
   token           VARCHAR(32) NOT NULL,
@@ -210,6 +220,8 @@ CREATE TABLE IF NOT EXISTS orders (
   UNIQUE KEY uk_orders_client_ref (client_ref),
   KEY idx_orders_status (status),
   KEY idx_orders_leg (leg_id, stage),
+  KEY idx_orders_pfe (pfe_trade_id, stage),
+  KEY idx_orders_ose (ose_trade_id, stage),
   KEY idx_orders_broker (broker_order_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -298,4 +310,308 @@ CREATE TABLE IF NOT EXISTS system_flags (
   value      VARCHAR(255) NULL,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- =========================================================================== --
+-- The Price-Filter Engine (doc/new.md). A second strategy over the same
+-- broker, the same instrument master, the same orders table and the same
+-- reconciler — but its own trade lifecycle, its own daily risk state and its
+-- own settings profile, because it disagrees with the scalper about what a
+-- good configuration is and merging the two would mean one silently getting
+-- the other's numbers.
+-- =========================================================================== --
+
+-- One row per selected contract, from the moment the scanner picks it to the
+-- moment the round trip is booked. It carries what `cycles`, `legs` and
+-- `positions` carry between them for the scalper — the PFE holds at most one
+-- position at a time, so one row says everything.
+CREATE TABLE IF NOT EXISTS pfe_trades (
+  id              INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  trade_date      DATE NOT NULL,
+  underlying      VARCHAR(24) NOT NULL,
+  expiry_date     DATE NOT NULL,
+  option_type     ENUM('CE','PE') NOT NULL,
+  token           VARCHAR(32) NOT NULL,
+  symbol          VARCHAR(64) NOT NULL,
+  strike          DECIMAL(12,2) NOT NULL,
+  lot_size        INT UNSIGNED NOT NULL,
+  qty             INT UNSIGNED NOT NULL,
+  state           VARCHAR(24) NOT NULL DEFAULT 'ARMED',
+  attempt_seq     INT UNSIGNED NOT NULL DEFAULT 0,
+  requote_count   INT UNSIGNED NOT NULL DEFAULT 0,
+  -- Completed index candles whose price position filter still permitted this
+  -- side. It is what the target ladder is indexed by, so it is the column that
+  -- explains why a trade's target was 4 points and not 1.
+  confirmations   INT UNSIGNED NOT NULL DEFAULT 0,
+  -- How many times the stop has been trailed. The gap tightens with each one,
+  -- so this is not cosmetic — it is an input to the next trail.
+  trails          INT UNSIGNED NOT NULL DEFAULT 0,
+  spot_at_select  DECIMAL(12,2) NULL,
+  direction_state VARCHAR(16) NULL,
+  select_score    DECIMAL(6,2) NULL,
+  -- The ranked candidate list and which liquidity checks could actually be
+  -- made. "Why this strike" is the first question of every post-mortem.
+  select_detail   JSON NULL,
+  entry_candle_id INT UNSIGNED NULL,
+  sell_price_p    INT NULL,
+  filled_price_p  INT NULL,
+  filled_qty      INT UNSIGNED NOT NULL DEFAULT 0,
+  target_price_p  INT NULL,
+  sl_price_p      INT NULL,
+  trail_peak_p    INT NULL,
+  entry_volume    BIGINT NULL,
+  exit_price_p    INT NULL,
+  gross_pnl_p     INT NULL,
+  charges_p       INT NULL,
+  net_pnl_p       INT NULL,
+  exit_reason     VARCHAR(32) NULL,
+  settings_snapshot JSON NULL,
+  armed_at        DATETIME NOT NULL,
+  opened_at       DATETIME NULL,
+  closed_at       DATETIME NULL,
+  updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_pfe_date (trade_date, id),
+  KEY idx_pfe_state (state)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- "Maximum simultaneous positions: 1" — doc/new.md §12 — enforced by the
+-- database rather than by remembering. Same partial-unique trick as
+-- `cycle_guard`: `open_key` is the constant 1 while a trade is live and NULL
+-- once it is finished, and MySQL treats NULLs as distinct in a UNIQUE index.
+CREATE TABLE IF NOT EXISTS pfe_guard (
+  trade_id  INT UNSIGNED NOT NULL,
+  open_key  TINYINT UNSIGNED NULL,
+  PRIMARY KEY (trade_id),
+  UNIQUE KEY uk_pfe_open (open_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Every scan the engine runs, whether or not it selected anything. A scan that
+-- found nothing is the more interesting row: it is the difference between "the
+-- market offered nothing" and "the filter can never pass on this account".
+CREATE TABLE IF NOT EXISTS pfe_scans (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  trade_date     DATE NOT NULL,
+  ts_ms          BIGINT UNSIGNED NOT NULL,
+  underlying     VARCHAR(24) NOT NULL,
+  expiry_date    DATE NULL,
+  side           VARCHAR(4) NULL,
+  spot           DECIMAL(12,2) NULL,
+  direction_state VARCHAR(16) NULL,
+  chosen_token   VARCHAR(32) NULL,
+  chosen_symbol  VARCHAR(64) NULL,
+  chosen_score   DECIMAL(6,2) NULL,
+  considered     INT UNSIGNED NOT NULL DEFAULT 0,
+  rejected       INT UNSIGNED NOT NULL DEFAULT 0,
+  -- Which liquidity fields the broker sent nothing for, across the whole scan.
+  unavailable    VARCHAR(255) NULL,
+  candidates     JSON NULL,
+  reason         VARCHAR(255) NULL,
+  created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_pfe_scan_date (trade_date, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- The PFE's own risk state for one trading day. Separate from `daily_stats`
+-- because the two engines have separate limits and separate P&L, and a shared
+-- row would let one strategy's losses disable the other.
+CREATE TABLE IF NOT EXISTS pfe_stats (
+  trade_date         DATE NOT NULL,
+  realized_pnl_p     INT NOT NULL DEFAULT 0,
+  gross_pnl_p        INT NOT NULL DEFAULT 0,
+  charges_p          INT NOT NULL DEFAULT 0,
+  trade_count        INT UNSIGNED NOT NULL DEFAULT 0,
+  entry_count        INT UNSIGNED NOT NULL DEFAULT 0,
+  scan_count         INT UNSIGNED NOT NULL DEFAULT 0,
+  win_count          INT UNSIGNED NOT NULL DEFAULT 0,
+  loss_count         INT UNSIGNED NOT NULL DEFAULT 0,
+  consecutive_losses INT UNSIGNED NOT NULL DEFAULT 0,
+  cooldown_until     DATETIME NULL,
+  disabled           TINYINT(1) NOT NULL DEFAULT 0,
+  disabled_reason    VARCHAR(64) NULL,
+  updated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- =========================================================================== --
+-- The Option Selling Engine (newdoc/update.md). A third strategy over the same
+-- broker, the same instrument master, the same orders table and the same
+-- reconciler — with its own trade lifecycle, its own decision log, its own
+-- state-transition audit and its own daily risk state.
+--
+-- §19 is explicit about what this layer is FOR: "audit trail, crash recovery and
+-- risk-counter durability — NOT hot-path decision data. No decision path
+-- performs a synchronous DB read." Only three writes block the engine (§19.2):
+-- the OPEN insert before an order is placed, the CLOSED update after the exit
+-- fill, and every risk-counter mutation. Everything else goes through a bounded
+-- async queue that must never stall a decision cycle.
+-- =========================================================================== --
+
+-- §19.1 `trades`. One row per position, from the moment the strike is selected
+-- to the moment the round trip is booked.
+CREATE TABLE IF NOT EXISTS ose_trades (
+  id                INT UNSIGNED NOT NULL AUTO_INCREMENT,
+  -- §6.1 — the engine-generated trade id. It is the §12.3 idempotency key:
+  -- `orders.client_ref` is derived from it, so a retried placement can only ever
+  -- collide with itself.
+  trade_uid         CHAR(36) NOT NULL,
+  trade_date        DATE NOT NULL,
+  underlying        VARCHAR(24) NOT NULL,
+  expiry_date       DATE NOT NULL,
+  option_type       ENUM('CE','PE') NOT NULL,
+  token             VARCHAR(32) NOT NULL,
+  symbol            VARCHAR(64) NOT NULL,
+  strike            DECIMAL(12,2) NOT NULL,
+  lot_size          INT UNSIGNED NOT NULL,
+  qty               INT UNSIGNED NOT NULL,
+  state             VARCHAR(24) NOT NULL DEFAULT 'ORDER_PENDING',
+  entry_trend       ENUM('BULLISH','BEARISH') NOT NULL,
+  -- What was asked for, and what actually filled. §12.4: every target and stop
+  -- derives from the FILL; the request is kept for slippage analysis alone, and
+  -- keeping both is the only way to measure §20.3 SEVERE_SLIPPAGE after the fact.
+  requested_price_p INT NOT NULL,
+  entry_price_p     INT NULL,
+  entry_ts          BIGINT UNSIGNED NULL,
+  entry_candle_ts   BIGINT UNSIGNED NULL,
+  entry_candle_id   INT UNSIGNED NULL,
+  filled_qty        INT UNSIGNED NOT NULL DEFAULT 0,
+  -- The ladder rung this trade reached. §14 — the column that explains why a
+  -- target was 4 points and not 1.
+  target_level      INT UNSIGNED NOT NULL DEFAULT 0,
+  target_price_p    INT NULL,
+  -- Monotone non-increasing for the life of the trade (§15.3). A row where this
+  -- ever rose is an integrity failure, not a data-entry mistake.
+  stop_price_p      INT NULL,
+  final_stop_p      INT NULL,
+  candles_held      INT UNSIGNED NOT NULL DEFAULT 0,
+  -- Maximum favourable excursion in premium POINTS, not paise: it is a
+  -- post-trade analysis figure, not a price.
+  mfe_points        DECIMAL(8,2) NOT NULL DEFAULT 0,
+  exit_price_p      INT NULL,
+  exit_ts           BIGINT UNSIGNED NULL,
+  exit_reason       VARCHAR(48) NULL,
+  exit_attempts     INT UNSIGNED NOT NULL DEFAULT 0,
+  gross_pnl_p       INT NULL,
+  charges_p         INT NULL,
+  -- The number the risk limits read. §17.3 and [MUST-CONFIRM #6]: a gross-scratch
+  -- round trip is a real net loss and the circuit breaker must see it as one.
+  net_pnl_p         INT NULL,
+  select_score      DECIMAL(9,6) NULL,
+  select_detail     JSON NULL,
+  settings_snapshot JSON NULL,
+  status            ENUM('OPEN','CLOSED','ERROR') NOT NULL DEFAULT 'OPEN',
+  created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_ose_uid (trade_uid),
+  KEY idx_ose_date_status (trade_date, status),
+  KEY idx_ose_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- §3.3 — "Single active trade. The engine MUST reject any entry attempt while
+-- activeTrade !== null." Enforced by the database as well as by the Risk Engine,
+-- using the same partial-unique trick as `cycle_guard` and `pfe_guard`:
+-- `open_key` is the constant 1 while a trade is live and NULL once it is
+-- finished, and MySQL treats NULLs as distinct in a UNIQUE index.
+--
+-- The in-process guard is the one §3.3 names; this one is what survives a
+-- process that died between selecting a strike and recording it.
+CREATE TABLE IF NOT EXISTS ose_guard (
+  trade_id  INT UNSIGNED NOT NULL,
+  open_key  TINYINT UNSIGNED NULL,
+  PRIMARY KEY (trade_id),
+  UNIQUE KEY uk_ose_open (open_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- §19.1 `decisions`. ONE ROW PER SEALED CANDLE, whether or not anything
+-- happened — roughly 4,300 rows a session.
+--
+-- The rows where nothing happened are the valuable ones. §11.5 forbids a silent
+-- rejection, and this table is where that promise is kept: every non-trade
+-- carries the trend, both midpoints, the reference price and the machine-readable
+-- reason, so "why did it not trade at 10:42:15" is a SELECT rather than an
+-- argument.
+CREATE TABLE IF NOT EXISTS ose_decisions (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  cycle_id        CHAR(36) NOT NULL,
+  trade_date      DATE NOT NULL,
+  candle_ts       BIGINT UNSIGNED NOT NULL,
+  nifty_open_p    INT NOT NULL,
+  nifty_high_p    INT NOT NULL,
+  nifty_low_p     INT NOT NULL,
+  nifty_close_p   INT NOT NULL,
+  synthetic       TINYINT(1) NOT NULL DEFAULT 0,
+  -- §7.8. How many SAMPLES the bucket held, and whether that was too few to
+  -- price an order from. On Kotak's REST quote fallback a 5s bar can hold one
+  -- sample, and one sample is not an OHLC — so these two columns are the record
+  -- of how much evidence each decision actually had.
+  --
+  -- They are stored rather than merely counted because a falling sample rate is
+  -- the leading indicator of every downstream problem (untradable candles,
+  -- skipped entries, a stop evaluated on a high that was never observed) and it
+  -- falls SILENTLY. A gauge answers "is it bad now"; only a column answers "was
+  -- it always like this", which is the question asked after a bad fill.
+  low_confidence  TINYINT(1) NOT NULL DEFAULT 0,
+  tick_count      INT UNSIGNED NOT NULL DEFAULT 0,
+  trend           ENUM('BULLISH','BEARISH','NONE') NOT NULL DEFAULT 'NONE',
+  trend_via       VARCHAR(24) NULL,
+  bullish_mid_p   INT NULL,
+  bearish_mid_p   INT NULL,
+  -- ENTRY_TAKEN, or the §11.5 rejection reason. Never null.
+  outcome         VARCHAR(48) NOT NULL,
+  detail          VARCHAR(255) NULL,
+  selected_symbol VARCHAR(64) NULL,
+  selection_score DECIMAL(9,6) NULL,
+  state           VARCHAR(24) NULL,
+  -- §23.1 budgets 100ms at p99 from CANDLE_SEALED to ORDER_PLACED. Recorded per
+  -- cycle so the budget is measured rather than assumed.
+  latency_ms      DECIMAL(9,3) NOT NULL DEFAULT 0,
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_ose_decision (trade_date, candle_ts),
+  KEY idx_ose_decision_outcome (outcome, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- §19.1 `state_transitions` and §18.3. Every transition the machine made, legal
+-- or illegal, with the trigger that caused it.
+CREATE TABLE IF NOT EXISTS ose_transitions (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  cycle_id      CHAR(36) NULL,
+  trade_uid     CHAR(36) NULL,
+  from_state    VARCHAR(32) NOT NULL,
+  to_state      VARCHAR(32) NOT NULL,
+  trigger_event VARCHAR(48) NOT NULL,
+  reason        VARCHAR(256) NULL,
+  -- An event/state pair that is not in the §18.2 table. Logged, ignored and
+  -- counted; three in a session halt the engine.
+  illegal       TINYINT(1) NOT NULL DEFAULT 0,
+  ts_ms         BIGINT UNSIGNED NOT NULL,
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_ose_trans_ts (ts_ms),
+  KEY idx_ose_trans_trade (trade_uid, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- §19.1 `risk_state` and §17.1. One row per trading day.
+--
+-- `halted` is NOT auto-clearing and MUST NOT be cleared by a process restart
+-- (§17.6). Only scripts/ose-reset-halt.js clears it, and it records the reset in
+-- `ose_transitions` when it does.
+CREATE TABLE IF NOT EXISTS ose_stats (
+  trade_date         DATE NOT NULL,
+  trades_today       INT UNSIGNED NOT NULL DEFAULT 0,
+  consecutive_losses INT UNSIGNED NOT NULL DEFAULT 0,
+  realised_pnl_p     INT NOT NULL DEFAULT 0,
+  gross_pnl_p        INT NOT NULL DEFAULT 0,
+  charges_p          INT NOT NULL DEFAULT 0,
+  win_count          INT UNSIGNED NOT NULL DEFAULT 0,
+  loss_count         INT UNSIGNED NOT NULL DEFAULT 0,
+  scratch_count      INT UNSIGNED NOT NULL DEFAULT 0,
+  cycles             INT UNSIGNED NOT NULL DEFAULT 0,
+  entries            INT UNSIGNED NOT NULL DEFAULT 0,
+  halted             TINYINT(1) NOT NULL DEFAULT 0,
+  halt_reason        VARCHAR(256) NULL,
+  halted_at          DATETIME NULL,
+  updated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (trade_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

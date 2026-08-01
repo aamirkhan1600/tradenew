@@ -20,6 +20,20 @@ const { ScalperEngine } = require('../src/strategy/scalperEngine');
 const settingsSvc = require('../src/strategy/settings');
 const { STATES } = require('../src/strategy/legMachine');
 
+// `_maybeRearm` asks the WALL CLOCK whether the square-off has passed, so these
+// tests read the real time of day. The window below was widened to keep them
+// inside it, but a window still has edges: `00:01`–`23:58` with a `23:59`
+// square-off leaves TWO MINUTES A DAY — 23:59 and 00:00 — where the gates do not
+// hold and the three tests that need a re-arm to succeed fail. That is a suite
+// which is green all day and red at midnight, which is the worst kind.
+//
+// So the clock is taken out of it: `isAfter` is pinned false for this file, and
+// no test here asserts the square-off gate (that behaviour belongs with the
+// square-off, not with PER_LEG re-arming). The window below now only has to be
+// self-consistent, not lucky.
+const time = require('../src/core/time');
+time.isAfter = () => false;
+
 // A session window wide enough that the wall clock is always inside it — these
 // tests are about the OTHER gates, and a suite that fails after 15:15 is worse
 // than useless.

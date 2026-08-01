@@ -23,10 +23,24 @@ const terminal = require('../market/terminal');
 const yahoo = require('../market/yahoo');
 const backfill = require('../market/backfill');
 const settingsService = require('../strategy/settings');
+const pfeRoutes = require('./pfeRoutes');
+const oseRoutes = require('./oseRoutes');
 const auth = require('./middleware/auth');
 const { ValidationError } = require('../core/errors');
 
 const router = express.Router();
+
+// The Price-Filter Engine (doc/new.md) — its own pages under /pfe and its own
+// API under /api/pfe. Mounted FIRST so its routes are matched before this
+// file's `/api` router, which they do not overlap with but which would
+// otherwise own the prefix.
+router.use(pfeRoutes);
+
+// The Option Selling Engine (newdoc/update.md) — its own pages under /ose and
+// its own API under /api/ose. Mounted alongside the PFE's for the same reason:
+// three engines share this account, and each needs its own page or it can only
+// be operated with SQL.
+router.use(oseRoutes);
 
 // Async handlers without a try/catch in every one.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -55,7 +69,18 @@ router.post('/logout', (req, res) => {
   res.redirect('/login');
 });
 
-router.get('/', auth.requirePage, wrap(async (req, res) => {
+// Signing in lands on the engine this deployment actually runs.
+//
+// `/login` redirects here, and the nav no longer advertises the scalper's
+// dashboard — so without this, the first thing an operator sees after signing in
+// is a page that was deliberately taken out of the menu, with no nav item lit.
+//
+// The scalper's dashboard is NOT deleted: it still renders at /dashboard, and
+// `npm run engine` still drives it. Change this line back if this deployment
+// ever leads with the scalper again.
+router.get('/', auth.requirePage, (req, res) => res.redirect('/ose'));
+
+router.get('/dashboard', auth.requirePage, wrap(async (req, res) => {
   res.render('dashboard', { page: 'dashboard', appUrl: config.appUrl });
 }));
 

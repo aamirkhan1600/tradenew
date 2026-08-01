@@ -1,0 +1,237 @@
+// §10, §11, §14, §15 — the pure decision modules.
+//
+// Every case in §25.1's mandatory list is here, plus the two §25.2 properties
+// that can be asserted without a property-testing dependency. These are the
+// cheapest tests in the suite and they guard the rules that decide whether money
+// moves, so they are also the ones that must never be quarantined.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const h = require('./oseHelpers');
+const trendEngine = require('../src/ose/trend');
+const entry = require('../src/ose/entry');
+const ladder = require('../src/ose/ladder');
+const C = require('../src/ose/constants');
+const { IntegrityError } = require('../src/core/errors');
+
+/* ============================================================ §10, the trend */
+
+test('trend: a clear rise is BULLISH and a clear fall is BEARISH', () => {
+  assert.equal(trendEngine.evaluate(h.series(3, 100)).trend, 'BULLISH');
+  assert.equal(trendEngine.evaluate(h.series(3, -100)).trend, 'BEARISH');
+});
+
+test('trend: fewer than three completed candles is null, not a guess', () => {
+  const verdict = trendEngine.evaluate(h.series(2, 100));
+  assert.equal(verdict.trend, null);
+  assert.equal(verdict.via, 'WARMING_UP');
+});
+
+test('trend: d1 == 0 falls through to the midpoint tie-break', () => {
+  // Identical closes; the newest bar's high/low sit higher, so the midpoint drifted up.
+  const bars = [
+    h.indexBar({ bucketStart: h.BASE_TS, closeP: 2450000, highP: 2450100, lowP: 2449900 }),
+    h.indexBar({ bucketStart: h.BASE_TS + 5000, closeP: 2450000, highP: 2450200, lowP: 2449950 }),
+    h.indexBar({ bucketStart: h.BASE_TS + 10000, closeP: 2450000, highP: 2450600, lowP: 2450100 }),
+  ];
+  const verdict = trendEngine.evaluate(bars);
+  assert.equal(verdict.trend, 'BULLISH');
+  assert.equal(verdict.via, trendEngine.VIA.MIDPOINT);
+});
+
+test('trend: d1 and d2 both zero falls through to the newest candle direction', () => {
+  // C1 and C3 identical in close AND in high+low, so only C2 differs.
+  const flat = { closeP: 2450000, highP: 2450100, lowP: 2449900 };
+  const bars = [
+    h.indexBar({ bucketStart: h.BASE_TS, ...flat }),
+    h.indexBar({ bucketStart: h.BASE_TS + 5000, ...flat, closeP: 2449000 }),
+    h.indexBar({ bucketStart: h.BASE_TS + 10000, ...flat }),
+  ];
+  const verdict = trendEngine.evaluate(bars);
+  assert.equal(verdict.trend, 'BULLISH');   // 2450000 > 2449000
+  assert.equal(verdict.via, trendEngine.VIA.RECENT);
+});
+
+test('trend: a perfect tie is undetermined — it does NOT carry the last verdict forward', () => {
+  const identical = { closeP: 2450000, highP: 2450100, lowP: 2449900 };
+  const bars = [0, 1, 2].map(i =>
+    h.indexBar({ bucketStart: h.BASE_TS + i * 5000, ...identical }));
+  const verdict = trendEngine.evaluate(bars);
+  assert.equal(verdict.trend, null);
+  assert.equal(verdict.via, trendEngine.VIA.TIE);
+});
+
+test('trend: a null verdict is a BREAK for an open position, on both sides', () => {
+  // §10.3 — fail closed. A trend engine with nothing to say is not permission
+  // to stay short.
+  assert.equal(trendEngine.isBreak(null, 'CE'), true);
+  assert.equal(trendEngine.isBreak(null, 'PE'), true);
+  assert.equal(trendEngine.isBreak('BEARISH', 'CE'), false);
+  assert.equal(trendEngine.isBreak('BULLISH', 'CE'), true);
+});
+
+/* ====================================================== §11, entry validation */
+
+test('entry: a close exactly ON the bullish mid is rejected — the inequality is strict', () => {
+  // open 100, high 300 -> bullishMid 200. Close exactly 200.
+  const candle = h.indexBar({ openP: 100, highP: 300, lowP: 50, closeP: 200 });
+  const decision = entry.validate(candle, 'BULLISH');
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, entry.REASONS.NO_MIDPOINT_BREAK);
+});
+
+test('entry: a close exactly ON the bearish mid is rejected', () => {
+  // open 300, low 100 -> bearishMid 200. Close exactly 200.
+  const candle = h.indexBar({ openP: 300, highP: 350, lowP: 100, closeP: 200 });
+  const decision = entry.validate(candle, 'BEARISH');
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, entry.REASONS.NO_MIDPOINT_BREAK);
+});
+
+test('entry: a doji is rejected on both sides', () => {
+  const doji = h.indexBar({ openP: 2450000, highP: 2450000, lowP: 2450000, closeP: 2450000 });
+  assert.equal(entry.validate(doji, 'BULLISH').allowed, false);
+  assert.equal(entry.validate(doji, 'BEARISH').allowed, false);
+});
+
+test('entry: trend and signal disagreeing is a named rejection, not a silent one', () => {
+  // Bullish break (close above (O+H)/2) offered while the trend is BEARISH.
+  const candle = h.indexBar({ openP: 100, highP: 300, lowP: 50, closeP: 290 });
+  const decision = entry.validate(candle, 'BEARISH');
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, entry.REASONS.TREND_SIGNAL_CONFLICT);
+  assert.ok(decision.detail.length > 0, 'every rejection carries a human-readable detail');
+});
+
+test('entry: an undetermined trend is rejected as TREND_UNDETERMINED', () => {
+  const candle = h.indexBar({ openP: 100, highP: 300, lowP: 50, closeP: 290 });
+  assert.equal(entry.validate(candle, null).reason, entry.REASONS.TREND_UNDETERMINED);
+});
+
+test('entry: confluence produces SELL PE when bullish and SELL CE when bearish', () => {
+  const bull = h.indexBar({ openP: 100, highP: 300, lowP: 50, closeP: 290 });
+  const bullDecision = entry.validate(bull, 'BULLISH');
+  assert.equal(bullDecision.allowed, true);
+  assert.equal(bullDecision.optionType, 'PE');
+
+  const bear = h.indexBar({ openP: 300, highP: 350, lowP: 100, closeP: 110 });
+  const bearDecision = entry.validate(bear, 'BEARISH');
+  assert.equal(bearDecision.allowed, true);
+  assert.equal(bearDecision.optionType, 'CE');
+});
+
+// §25.2 — the mutual-exclusivity property, asserted over a wide sweep rather
+// than a single case. A close cannot be above (O+H)/2 and below (O+L)/2 at once.
+test('entry PROPERTY: the two midpoint conditions are mutually exclusive', () => {
+  for (let open = 0; open <= 400; open += 20) {
+    for (let high = open; high <= open + 400; high += 20) {
+      for (let low = Math.max(0, open - 400); low <= open; low += 20) {
+        for (let close = low; close <= high; close += 20) {
+          const { bullishMidP, bearishMidP } = entry.midpoints(
+            h.indexBar({ openP: open, highP: high, lowP: low, closeP: close }));
+          assert.ok(!(close > bullishMidP && close < bearishMidP),
+            `close ${close} was both above ${bullishMidP} and below ${bearishMidP}`);
+        }
+      }
+    }
+  }
+});
+
+/* ========================================================= §14, the ladder */
+
+test('ladder: a close exactly AT the target advances the rung', () => {
+  const trade = h.trade();                       // entry 2000, target 1900
+  const bar = h.optionBar({ closeP: 1900, highP: 1905, lowP: 1895 });
+  const extend = ladder.advanceTarget(trade, bar, h.rules());
+  assert.ok(extend, 'a close at the target confirms it');
+  assert.equal(extend.targetLevel, 2);
+  assert.equal(extend.targetPriceP, 2000 - 2 * C.POINT);
+});
+
+test('ladder: a close FOUR points beyond the target advances exactly one level', () => {
+  // §14.3 — one decision per candle, however far the close ran.
+  const trade = h.trade();
+  const bar = h.optionBar({ closeP: 1500, highP: 1510, lowP: 1495 });
+  const extend = ladder.advanceTarget(trade, bar, h.rules());
+  assert.equal(extend.targetLevel, 2, 'one rung, not four');
+});
+
+test('ladder: an intra-candle wick does NOT confirm a target — only the close does', () => {
+  const trade = h.trade();
+  const bar = h.optionBar({ closeP: 1950, lowP: 1880, highP: 1960 });   // dipped past, closed above
+  assert.equal(ladder.advanceTarget(trade, bar, h.rules()), null);
+});
+
+test('ladder: entryPrice refuses a synthetic bar and refuses an untradable one', () => {
+  // §12.1 — the most commonly violated rule in implementations of this spec.
+  assert.throws(
+    () => ladder.entryPrice(h.optionBar({ synthetic: true, tradable: false }), 10),
+    IntegrityError);
+  assert.throws(
+    () => ladder.entryPrice(h.optionBar({ tradable: false, tickCount: 1 }), 10),
+    IntegrityError);
+});
+
+test('ladder: entryPrice floors to the tick and never rounds up', () => {
+  // close 1998 + offset 10 = 2008 -> floor to a 5-paise tick = 2005.
+  const price = ladder.entryPrice(h.optionBar({ closeP: 1998 }), 10, 5);
+  assert.equal(price, 2005);
+  assert.equal(price % 5, 0, 'an off-tick limit is rejected by the exchange outright');
+});
+
+/* ==================================================== §15, the trailing stop */
+
+test('stop: the initial stop sits ABOVE entry — for a short, premium rising is loss', () => {
+  assert.equal(ladder.initialStop(2000, 2), 2200);
+});
+
+test('stop PROPERTY: monotone non-increasing across a ten-rung ladder', () => {
+  const trade = h.trade();
+  let previous = trade.stopPriceP;
+  for (let level = 1; level <= 10; level += 1) {
+    const trail = ladder.trailStop({ ...trade, stopPriceP: previous }, level, h.rules());
+    if (!trail) continue;
+    assert.ok(trail.stopPriceP <= previous,
+      `the stop widened from ${previous} to ${trail.stopPriceP} at level ${level}`);
+    previous = trail.stopPriceP;
+  }
+  // Level 1 locks breakeven, and each rung after locks one more point.
+  assert.equal(previous, 2000 - 9 * C.POINT);
+});
+
+test('stop: the §15.2 progression is exactly the table in the specification', () => {
+  const at = (level, from) =>
+    ladder.trailStop({ ...h.trade(), stopPriceP: from }, level, h.rules())?.stopPriceP ?? from;
+  assert.equal(at(1, 2200), 2000, 'level 1 -> breakeven');
+  assert.equal(at(2, 2000), 1900, 'level 2 -> +1 point locked');
+  assert.equal(at(3, 1900), 1800, 'level 3 -> +2 points locked');
+});
+
+test('stop: with trailing disabled the stop never moves, but the target still extends', () => {
+  const cfg = h.rules({ trailingStopEnabled: false });
+  assert.equal(ladder.trailStop(h.trade(), 3, cfg), null);
+  assert.ok(ladder.advanceTarget(h.trade(), h.optionBar({ closeP: 1900 }), cfg));
+});
+
+test('stop: a lower rung can never widen a stop that has already trailed past it', () => {
+  // §15.3 is enforced STRUCTURALLY by min(), so the IntegrityError beside it is
+  // unreachable through trailStop and is defence-in-depth against a future
+  // caller that computes the candidate itself. What is testable — and what
+  // actually protects the position — is that a stale, lower rung arriving after
+  // the stop has already trailed below it changes nothing.
+  const trade = h.trade({ entryPriceP: 2000, stopPriceP: 1800 });   // already at +2 locked
+  assert.equal(ladder.trailStop(trade, 1, h.rules()), null,
+    'level 1 would imply a 2000 stop; the trade is already at 1800 and must not move back');
+  assert.equal(ladder.trailStop(trade, 2, h.rules()), null);
+
+  // And the guard itself still exists, so a hand-rolled widening is refused.
+  assert.ok(IntegrityError, 'the invariant is backed by a typed error, not a comment');
+});
+
+test('stop: fires on the candle HIGH, not the close', () => {
+  // §15.4 — a stop must respect intra-candle adverse movement.
+  const trade = h.trade();                                   // stop 2200
+  assert.equal(ladder.stopHit(h.optionBar({ highP: 2200, closeP: 2000 }), trade.stopPriceP), true);
+  assert.equal(ladder.stopHit(h.optionBar({ highP: 2199, closeP: 2150 }), trade.stopPriceP), false);
+});

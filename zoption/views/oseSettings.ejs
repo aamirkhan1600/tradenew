@@ -1,0 +1,210 @@
+<%- include('partials/head', { title: 'zoption — option selling settings' }) %>
+<%- include('partials/nav', { page: page }) %>
+
+<main class="wrap">
+
+  <% if (error) { %>
+    <section class="card warnbox">
+      <h2 class="down">Not saved</h2>
+      <p class="msg bad"><%= error %></p>
+    </section>
+  <% } %>
+  <% if (saved) { %>
+    <section class="card"><p class="msg ok"><%= saved %></p></section>
+  <% } %>
+
+  <% if (warnings && warnings.length) { %>
+    <section class="card warnbox">
+      <h2>Worth a look <small>legal settings that are probably not what you meant</small></h2>
+      <ul><% warnings.forEach(function (w) { %><li><%= w %></li><% }); %></ul>
+    </section>
+  <% } %>
+
+  <!-- §17.3.1. Charges are per ROUND TRIP and dominated by a flat brokerage, so
+       a one-point target can be a guaranteed loss before the market is consulted
+       at all. Shown before any of the inputs, deliberately. -->
+  <section class="card">
+    <h2>What this configuration needs to break even
+      <small>charges are paid in full on winners and losers alike</small></h2>
+    <dl class="kv">
+      <dt>Quantity</dt><dd><%= note.qty %> (<%= settings.lots %> lot)</dd>
+      <dt>Round-trip charges</dt><dd><%= money.formatInr(note.chargesP) %></dd>
+      <dt>Break-even move</dt><dd>₹<%= (note.breakevenPointsP / 100).toFixed(2) %> of premium</dd>
+      <dt>First rung (<%= settings.initialTargetPoints %> pt)</dt>
+      <dd>
+        <% if (note.requiredWinRate === null) { %>
+          <span class="down">a win loses money at this size</span>
+        <% } else { %>
+          needs a <b class="<%= note.requiredWinRate >= 0.6 ? 'down' : '' %>"><%= (note.requiredWinRate * 100).toFixed(0) %>%</b>
+          win rate · win <%= money.formatInr(note.winP) %>, loss <%= money.formatInr(note.lossP) %>
+        <% } %>
+      </dd>
+    </dl>
+  </section>
+
+  <form class="card" method="post" action="/ose/settings">
+
+    <h2>Contract <small>§5.1 — the engine snapshots these when it selects a strike</small></h2>
+    <div class="grid">
+      <label>Premium minimum ₹
+        <input name="premiumMin" type="number" step="0.05" value="<%= settings.premiumMin %>">
+      </label>
+      <label>Premium maximum ₹
+        <input name="premiumMax" type="number" step="0.05" value="<%= settings.premiumMax %>">
+      </label>
+      <label>Entry offset ₹ <span class="hint">added to the sealed close</span>
+        <input name="entryOffset" type="number" step="0.05" value="<%= settings.entryOffset %>">
+      </label>
+      <label>Lots <span class="hint">[MUST-CONFIRM #2]</span>
+        <input name="lots" type="number" step="1" min="1" value="<%= settings.lots %>">
+      </label>
+      <label>Execution
+        <select name="mode">
+          <option value="PAPER" <%= settings.mode === 'PAPER' ? 'selected' : '' %>>PAPER — simulated, nothing reaches the exchange</option>
+          <option value="LIVE"  <%= settings.mode === 'LIVE'  ? 'selected' : '' %>>LIVE — orders reach the exchange</option>
+        </select>
+      </label>
+    </div>
+
+    <h2>Target and stop <small>§14, §15 — premium points, never index points</small></h2>
+    <div class="grid">
+      <label>Initial target (points)
+        <input name="initialTargetPoints" type="number" step="1" min="1" value="<%= settings.initialTargetPoints %>">
+      </label>
+      <label>Initial stop (points)
+        <input name="initialStopPoints" type="number" step="1" min="1" value="<%= settings.initialStopPoints %>">
+      </label>
+      <label>Target extension (points)
+        <input name="targetExtensionPoints" type="number" step="1" min="1" value="<%= settings.targetExtensionPoints %>">
+      </label>
+      <label>Premium safety exit (points)
+        <input name="premiumSafetyExitPoints" type="number" step="1" min="1" value="<%= settings.premiumSafetyExitPoints %>">
+      </label>
+      <label>Trailing stop <span class="hint">§15.5</span>
+        <select name="trailingStopEnabled">
+          <option value="true"  <%= settings.trailingStopEnabled ? 'selected' : '' %>>ON — tighten the stop on every rung</option>
+          <option value="false" <%= settings.trailingStopEnabled ? '' : 'selected' %>>OFF — the stop stays at entry + initial</option>
+        </select>
+      </label>
+      <!-- §16.4. The stop is otherwise evaluated once per 5s candle on a SAMPLED
+           high, so a spike between two polls leaves no trace in the candle and
+           does not fire it at all. -->
+      <label>Sampled-stop guard <span class="hint">[MUST-CONFIRM #12]</span>
+        <select name="stopGuardEnabled">
+          <option value="true"  <%= settings.stopGuardEnabled ? 'selected' : '' %>>ON — re-check the live sample every second</option>
+          <option value="false" <%= settings.stopGuardEnabled ? '' : 'selected' %>>OFF — the 5s candle high only</option>
+        </select>
+      </label>
+    </div>
+
+    <h2>Selection <small>§9 — and what this Kotak account can actually filter on</small></h2>
+    <div class="grid">
+      <label>Liquidity mode <span class="hint">[MUST-CONFIRM #13]</span>
+        <select name="liquidityMode">
+          <option value="STRICT"  <%= settings.liquidityMode === 'STRICT'  ? 'selected' : '' %>>STRICT — a field the broker omits is a FAILURE</option>
+          <option value="LENIENT" <%= settings.liquidityMode === 'LENIENT' ? 'selected' : '' %>>LENIENT — skip it, and record that it was skipped</option>
+        </select>
+      </label>
+      <label>Scan range <span class="hint">strikes either side of ATM</span>
+        <input name="scanRange" type="number" step="1" min="1" max="40" value="<%= settings.scanRange %>">
+      </label>
+      <label>Trade on expiry day <span class="hint">[MUST-CONFIRM #7]</span>
+        <select name="tradeOnExpiryDay">
+          <option value="true"  <%= settings.tradeOnExpiryDay ? 'selected' : '' %>>ON</option>
+          <option value="false" <%= settings.tradeOnExpiryDay ? '' : 'selected' %>>OFF</option>
+        </select>
+      </label>
+    </div>
+    <p class="hint">
+      This account answers the <code>ltp</code> quote filter and nothing else, so open interest,
+      volume and the bid/ask spread never arrive. STRICT therefore selects <b>no strike at all</b>
+      — the correct behaviour of a required filter with nothing to filter on, and visible rather
+      than silent. Re-check with <code>node scripts/diagnose-spot.js</code>.
+    </p>
+
+    <h2>Candle quality <small>§7.8 — [MUST-CONFIRM #11]</small></h2>
+    <div class="grid">
+      <label>Index minimum samples
+        <input name="indexMinTicks" type="number" step="1" min="0" value="<%= settings.indexMinTicks %>">
+      </label>
+      <label>Option minimum samples
+        <input name="optionMinTicks" type="number" step="1" min="0" value="<%= settings.optionMinTicks %>">
+      </label>
+    </div>
+    <p class="hint">
+      A 5-second bar is built from REST quote samples — at most five, often one or two. A bar
+      holding fewer than this may not price an order. Too high and the engine never trades; too
+      low and it prices from a close that predates the bucket by most of its width.
+    </p>
+
+    <h2>Risk <small>§17</small></h2>
+    <div class="grid">
+      <label>Maximum trades per day
+        <input name="maxTradesPerDay" type="number" step="1" min="1" value="<%= settings.maxTradesPerDay %>">
+      </label>
+      <label>Maximum consecutive losses <span class="hint">trips a HALT</span>
+        <input name="maxConsecutiveLosses" type="number" step="1" min="1" value="<%= settings.maxConsecutiveLosses %>">
+      </label>
+      <label>Re-entry wait (candles)
+        <input name="reentryWaitCandles" type="number" step="1" min="0" value="<%= settings.reentryWaitCandles %>">
+      </label>
+      <div class="actions">
+        <button type="submit" class="go">Save</button>
+        <a class="link" href="/ose">Back to the engine</a>
+        <span class="hint">
+          The engine reads settings at cycle start, never mid-cycle — a save takes effect on the
+          next candle, and an open position keeps the numbers it was opened with.
+        </span>
+      </div>
+    </div>
+  </form>
+
+  <!-- §22. The engine ENFORCES this list rather than merely stating it:
+       settings.load() refuses LIVE while any id is missing.
+
+       A SEPARATE form from the settings above, on purpose. It posts only the
+       sign-off boxes, so every other key arrives absent and keeps its stored
+       value — and `coerce` rebuilds `confirmed` from whatever is ticked, which
+       is what makes withdrawing a sign-off possible at all. -->
+  <form class="card" method="post" action="/ose/settings">
+    <h2>Specification sign-off
+      <small>§22 — LIVE mode refuses to start while any of these is unsigned</small></h2>
+    <p class="hint">
+      <b><%= unsigned.length %> of <%= mustConfirm.length %></b> unsigned. Ticking a box records
+      that the trading desk has agreed that item; clearing one withdraws it, because a sign-off
+      must be reversible when a rule changes underneath it.
+    </p>
+    <!-- Marks this form as the OWNER of the §22 register. Without it, a save
+         from the settings form above would arrive with no boxes ticked and
+         withdraw every sign-off as a side effect. -->
+    <input type="hidden" name="confirm_form" value="1">
+    <div class="tablewrap">
+      <table class="events signoff">
+        <thead>
+          <tr><th>Signed</th><th>#</th><th>§</th><th>Item</th><th>Shipped answer</th></tr>
+        </thead>
+        <tbody>
+          <% mustConfirm.forEach(function (m) { %>
+            <tr class="<%= unsigned.indexOf(m.id) === -1 ? 'signed' : 'unsigned' %>">
+              <td><input type="checkbox" name="confirm_<%= m.id %>" value="true"
+                         <%= unsigned.indexOf(m.id) === -1 ? 'checked' : '' %>></td>
+              <td class="num">#<%= m.id %></td>
+              <td class="num"><%= m.section %></td>
+              <td>
+                <%= m.item %>
+                <% if (m.note) { %><div class="hint"><%= m.note %></div><% } %>
+              </td>
+              <td class="muted"><%= m.proposed %></td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <button type="submit" class="go">Save sign-offs</button>
+    </div>
+  </form>
+
+</main>
+
+<%- include('partials/foot') %>

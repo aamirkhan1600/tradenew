@@ -115,6 +115,36 @@ const config = {
     orderConfirmPollMs: int('ORDER_CONFIRM_POLL_MS', 750),
   },
 
+  // The Option Selling Engine (newdoc/update.md). Infrastructure only — §5.3 is
+  // explicit that no business logic may live in the environment, so the strategy
+  // parameters are in the `ose` settings row and the constants are compiled in.
+  ose: {
+    // §26.5 — the operator's guaranteed intervention path. Creating this file
+    // exits any open position at MARKET, cancels every order and halts, within
+    // one second. It is polled by the priority-0 timer rather than the candle
+    // cycle, so it works even when market data has stopped — which is exactly
+    // the situation an operator most needs it in.
+    killSwitchFile: str('OSE_KILL_SWITCH_FILE',
+      path.join(__dirname, '..', '..', 'run', 'ose.HALT')),
+    // §17.7 — the exchange trading calendar. A missing or stale list refuses to
+    // start in production.
+    holidayFile: str('OSE_HOLIDAY_FILE', path.join(__dirname, '..', '..', 'config', 'holidays.json')),
+    // §19.2 — the async write queue. Past `warnDepth` it says so; past
+    // `maxDepth` it drops the oldest rather than letting an audit backlog stall
+    // a decision cycle. Losing a decision row is bad; missing a stop is worse.
+    queueWarnDepth: int('OSE_QUEUE_WARN_DEPTH', 1000),
+    queueMaxDepth: int('OSE_QUEUE_MAX_DEPTH', 5000),
+
+    // `npm start` also starts the trading engine as a child process.
+    //
+    // It couples the two tiers — a web restart now bounces the engine — and that
+    // is survivable only because shutdown never flattens an open position and
+    // §20.6 reconciliation adopts it on the next boot. Turn this off to run
+    // `npm run ose` yourself, which is what you want if the engine should live
+    // on a different box or outlive the console.
+    autostart: bool('OSE_AUTOSTART', true),
+  },
+
   candles: {
     // A bar assembled from fewer ticks than this is low-confidence — the close
     // may predate the bucket by most of its width — and will not trigger an
