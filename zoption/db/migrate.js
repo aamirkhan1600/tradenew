@@ -45,6 +45,31 @@ async function indexExists(conn, table, index) {
   return rows.length > 0;
 }
 
+// Convert a JSON column to LONGTEXT, once.
+//
+// `CREATE TABLE IF NOT EXISTS` will not alter a table that already exists, so a
+// database built before the change keeps its JSON columns and behaves
+// differently from a fresh one: the driver hands back a parsed OBJECT from a
+// JSON column and a STRING from LONGTEXT. Every reader here copes with both, but
+// two servers disagreeing about the type is exactly the sort of difference that
+// only shows up on the one you did not test.
+//
+// Only touches a column whose type is genuinely `json`. On MariaDB, `JSON` is
+// already an alias for LONGTEXT, so this is a no-op there.
+async function jsonToLongtext(conn, table, column, notNull = false) {
+  const [rows] = await conn.query(
+    `SELECT data_type FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = ? AND column_name = ? LIMIT 1`,
+    [DB.database, table, column]);
+  if (!rows.length) return false;
+  if (String(rows[0].data_type || rows[0].DATA_TYPE).toLowerCase() !== 'json') return false;
+
+  await conn.query(
+    `ALTER TABLE \`${table}\` MODIFY \`${column}\` LONGTEXT ${notNull ? 'NOT NULL' : 'NULL'}`);
+  console.log(`  ~ ${table}.${column}  JSON -> LONGTEXT`);
+  return true;
+}
+
 async function addColumn(conn, table, column, definition) {
   if (await columnExists(conn, table, column)) return false;
   await conn.query(`ALTER TABLE \`${table}\` ADD COLUMN ${definition}`);
@@ -111,6 +136,22 @@ async function patch(conn) {
   // deliberate and is NOT the same claim as "that bar had no samples": a zero
   // here means "not recorded". Anything reading the distribution must filter to
   // rows written after the migration, which is what the id ordering is for.
+  // Every JSON column, converted in place. Listed rather than discovered so the
+  // set is reviewable — a loop over information_schema would also catch a column
+  // some future migration deliberately made JSON.
+  for (const [table, column, notNull] of [
+    ['settings', 'payload', true],
+    ['cycles', 'settings_snapshot', false],
+    ['events', 'payload', false],
+    ['pfe_trades', 'select_detail', false],
+    ['pfe_trades', 'settings_snapshot', false],
+    ['pfe_scans', 'candidates', false],
+    ['ose_trades', 'select_detail', false],
+    ['ose_trades', 'settings_snapshot', false],
+  ]) {
+    if (await tableExists(table)) await jsonToLongtext(conn, table, column, notNull);
+  }
+
   if (await tableExists('ose_decisions')) {
     await addColumn(conn, 'ose_decisions', 'low_confidence',
       'low_confidence TINYINT(1) NOT NULL DEFAULT 0 AFTER synthetic');

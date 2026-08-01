@@ -1,3 +1,16 @@
+-- NOTE ON `LONGTEXT` RATHER THAN `JSON`
+--
+-- These columns hold JSON documents and every one of them is written with
+-- JSON.stringify and read back with a "parse it if it is a string" guard. The
+-- column type is therefore free, and LONGTEXT is chosen because JSON is not:
+-- MySQL gained it in 5.7 and MariaDB in 10.2, and a schema that will not apply
+-- is a deployment that does not happen.
+--
+-- The one thing given up is server-side validation of the document. Nothing
+-- relied on it: the writers are all JSON.stringify, so an invalid document
+-- could only come from someone editing a row by hand, and the readers already
+-- treat a parse failure as "no detail" rather than trusting the column.
+
 -- zoption schema. Statement-per-`;`, every table CREATE TABLE IF NOT EXISTS so
 -- the file is safe to re-run. Columns added to an already-deployed table need an
 -- idempotent patch block in migrate.js as well — IF NOT EXISTS will not alter a
@@ -65,7 +78,7 @@ CREATE TABLE IF NOT EXISTS instruments (
 CREATE TABLE IF NOT EXISTS settings (
   id              INT UNSIGNED NOT NULL AUTO_INCREMENT,
   name            VARCHAR(64) NOT NULL DEFAULT 'default',
-  payload         JSON NOT NULL,
+  payload         LONGTEXT NOT NULL,
   version         INT UNSIGNED NOT NULL DEFAULT 1,
   updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -89,7 +102,7 @@ CREATE TABLE IF NOT EXISTS cycles (
   spot_at_lock  DECIMAL(12,2) NULL,
   lot_size      INT UNSIGNED NOT NULL,
   qty           INT UNSIGNED NOT NULL,
-  settings_snapshot JSON NULL,
+  settings_snapshot LONGTEXT NULL,
   status        ENUM('LOCKED','CLOSING','CLOSED') NOT NULL DEFAULT 'LOCKED',
   locked_at     DATETIME NOT NULL,
   unlocked_at   DATETIME NULL,
@@ -285,7 +298,7 @@ CREATE TABLE IF NOT EXISTS events (
   from_state  VARCHAR(32) NULL,
   to_state    VARCHAR(32) NULL,
   reason      VARCHAR(255) NULL,
-  payload     JSON NULL,
+  payload     LONGTEXT NULL,
   ts_ms       BIGINT UNSIGNED NOT NULL,
   created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -351,7 +364,7 @@ CREATE TABLE IF NOT EXISTS pfe_trades (
   select_score    DECIMAL(6,2) NULL,
   -- The ranked candidate list and which liquidity checks could actually be
   -- made. "Why this strike" is the first question of every post-mortem.
-  select_detail   JSON NULL,
+  select_detail   LONGTEXT NULL,
   entry_candle_id INT UNSIGNED NULL,
   sell_price_p    INT NULL,
   filled_price_p  INT NULL,
@@ -365,7 +378,7 @@ CREATE TABLE IF NOT EXISTS pfe_trades (
   charges_p       INT NULL,
   net_pnl_p       INT NULL,
   exit_reason     VARCHAR(32) NULL,
-  settings_snapshot JSON NULL,
+  settings_snapshot LONGTEXT NULL,
   armed_at        DATETIME NOT NULL,
   opened_at       DATETIME NULL,
   closed_at       DATETIME NULL,
@@ -405,7 +418,7 @@ CREATE TABLE IF NOT EXISTS pfe_scans (
   rejected       INT UNSIGNED NOT NULL DEFAULT 0,
   -- Which liquidity fields the broker sent nothing for, across the whole scan.
   unavailable    VARCHAR(255) NULL,
-  candidates     JSON NULL,
+  candidates     LONGTEXT NULL,
   reason         VARCHAR(255) NULL,
   created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -497,8 +510,8 @@ CREATE TABLE IF NOT EXISTS ose_trades (
   -- round trip is a real net loss and the circuit breaker must see it as one.
   net_pnl_p         INT NULL,
   select_score      DECIMAL(9,6) NULL,
-  select_detail     JSON NULL,
-  settings_snapshot JSON NULL,
+  select_detail     LONGTEXT NULL,
+  settings_snapshot LONGTEXT NULL,
   status            ENUM('OPEN','CLOSED','ERROR') NOT NULL DEFAULT 'OPEN',
   created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
