@@ -70,6 +70,72 @@ async function jsonToLongtext(conn, table, column, notNull = false) {
   return true;
 }
 
+// Drop the `json_valid(...)` CHECK constraints MariaDB attaches when a column is
+// declared JSON.
+//
+// They survive the change to LONGTEXT, so a database built before it validates
+// JSON on write while a fresh one does not. That asymmetry is the problem: a
+// value that inserts on one server and is rejected on the other is a difference
+// that only shows up where nobody tested, and it is not worth keeping for a
+// check every writer already satisfies — every one of these columns is written
+// with JSON.stringify.
+//
+// Scoped to clauses that are literally `json_valid(...)`, so a CHECK somebody
+// added on purpose is never touched. If the server has no CHECK_CONSTRAINTS view
+// (MySQL below 8.0.16) there is nothing to drop and nothing to do.
+//
+// Removed by REDEFINING THE COLUMN, not by `DROP CONSTRAINT`. MariaDB attaches
+// the JSON alias's check to the column rather than to the table, and a
+// column-level check has no independent existence to drop:
+//
+//     ALTER TABLE settings DROP CONSTRAINT payload
+//       -> Can't DROP CONSTRAINT `payload`; check that it exists
+//     ALTER TABLE settings MODIFY payload LONGTEXT NOT NULL
+//       -> gone
+//
+// The MODIFY restates the type the schema already declares, so it is a no-op for
+// the data — verified against a populated table — and it is what actually
+// detaches the constraint.
+async function dropJsonValidChecks(conn) {
+  let rows;
+  try {
+    [rows] = await conn.query(
+      `SELECT constraint_name AS n, table_name AS t, check_clause AS c
+         FROM information_schema.check_constraints
+        WHERE constraint_schema = ?`, [DB.database]);
+  } catch (_) {
+    return 0;                                   // no such view; nothing to do
+  }
+
+  let dropped = 0;
+  for (const row of rows || []) {
+    const clause = String(row.c ?? row.CHECK_CLAUSE ?? '');
+    if (!/^\s*json_valid\s*\(/i.test(clause)) continue;
+    const table = row.t ?? row.TABLE_NAME;
+    const column = row.n ?? row.CONSTRAINT_NAME;   // named after the column
+    if (!table || !column) continue;
+
+    // Keep the column's own nullability — re-declaring `payload` as NULL when the
+    // schema says NOT NULL would quietly weaken it.
+    const [meta] = await conn.query(
+      `SELECT is_nullable AS nullable FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = ? AND column_name = ? LIMIT 1`,
+      [DB.database, table, column]);
+    if (!meta.length) continue;
+    const nullable = String(meta[0].nullable ?? meta[0].IS_NULLABLE).toUpperCase() === 'YES';
+
+    try {
+      await conn.query(
+        `ALTER TABLE \`${table}\` MODIFY \`${column}\` LONGTEXT ${nullable ? 'NULL' : 'NOT NULL'}`);
+      console.log(`  - ${table}.${column}  json_valid CHECK removed`);
+      dropped += 1;
+    } catch (err) {
+      console.log(`  ! could not remove the check on ${table}.${column}: ${err.message}`);
+    }
+  }
+  return dropped;
+}
+
 async function addColumn(conn, table, column, definition) {
   if (await columnExists(conn, table, column)) return false;
   await conn.query(`ALTER TABLE \`${table}\` ADD COLUMN ${definition}`);
@@ -151,6 +217,9 @@ async function patch(conn) {
   ]) {
     if (await tableExists(table)) await jsonToLongtext(conn, table, column, notNull);
   }
+
+  // ...and the CHECK constraints that came with the JSON declaration.
+  await dropJsonValidChecks(conn);
 
   if (await tableExists('ose_decisions')) {
     await addColumn(conn, 'ose_decisions', 'low_confidence',
