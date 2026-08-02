@@ -14,6 +14,13 @@
 //   --fill-all                                     fill every entry AT its limit.
 //                                                  An upper bound nobody can
 //                                                  reach — see FILL_ALL below
+//   --min-move 70                                  stretch a quiet real session
+//                                                  until it spans 70 index
+//                                                  points, keeping its shape
+//   --offset 0.3 / --fill-window 3000              override the entry limit and
+//                                                  the time it waits to fill
+//   --no-trend-break / --no-filter-fail            disable either half of §13.3
+//                                                  for this run only
 //
 // The engine is REAL — the decision cycle, the strike selector, the ladder, the
 // exits, the order router, the paper broker and every `ose_*` table. What is
@@ -115,6 +122,20 @@ const NO_FILTER_FAIL = process.argv.includes('--no-filter-fail');
 const NO_FILTER_EXIT = process.argv.includes('--no-filter-exit');
 const OFFSET = argStr('offset', null);
 const FILL_WINDOW = arg('fill-window', null);
+// Amplify a real session so the window covers at least this many index points.
+//
+// A quiet hour is a real hour, and most hours are quiet: 2026-07-30 from 10:00
+// spans 19 points, which exercises the engine's refusals far more than its
+// trades. `--min-move 70` keeps that hour's SHAPE — every turn, every pause,
+// every reversal, in the order the exchange produced them — and scales its
+// AMPLITUDE about the opening level until the high-to-low range reaches the
+// number asked for. A window already wider than the target is left alone.
+//
+// The result is synthetic and says so on every run. It is a stress test of the
+// decision path against a violent tape, not evidence about a real one: NIFTY
+// did not move 70 points in that hour, and no P&L from an amplified path is a
+// claim about what the day would have paid.
+const MIN_MOVE = arg('min-move', null);
 
 const STEP_MS = 5000;
 const STRIKE_STEP = 50;
@@ -212,6 +233,34 @@ async function buildHistoryPath(path, bars, t0, rnd) {
   console.log(`  REAL index path: ${day} from ${START}, ${minutes.length} one-minute bars`);
   console.log('  minute open/high/low/close are REAL; the path inside each minute is constructed;');
   console.log('  the option chain is modelled off the spot (Yahoo has no NSE option data).');
+
+  // --min-move: scale the session's amplitude about its opening level until the
+  // high-to-low range reaches the target. Every bar is scaled by the SAME factor
+  // about the SAME anchor, so the shape is preserved exactly — the ratio between
+  // any two deviations is unchanged, and a bar that was flat stays flat.
+  let scale = 1;
+  if (MIN_MOVE !== null) {
+    const anchor = minutes[0].open;
+    const hi = Math.max(...minutes.map(m => m.high));
+    const lo = Math.min(...minutes.map(m => m.low));
+    const realRange = hi - lo;
+    if (realRange > 0 && realRange < Number(MIN_MOVE)) {
+      scale = Number(MIN_MOVE) / realRange;
+      const grow = (v) => anchor + (v - anchor) * scale;
+      for (const m of minutes) {
+        m.open = grow(m.open); m.high = grow(m.high);
+        m.low = grow(m.low); m.close = grow(m.close);
+      }
+      console.log('');
+      console.log(`  *** AMPLIFIED ${scale.toFixed(2)}x: this hour really moved `
+        + `${realRange.toFixed(1)} points, stretched to ${Number(MIN_MOVE).toFixed(1)}. ***`);
+      console.log('  The SHAPE is the real session — every turn and pause in exchange order.');
+      console.log('  The SIZE is invented. No P&L below is a claim about what this day paid.');
+    } else {
+      console.log('');
+      console.log(`  --min-move ${MIN_MOVE}: already ${realRange.toFixed(1)} points — left as-is.`);
+    }
+  }
   console.log('');
 
   let seq = 0;
