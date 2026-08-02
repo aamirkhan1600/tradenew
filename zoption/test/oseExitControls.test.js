@@ -207,3 +207,49 @@ test('neither switch can suppress §3.8, the unreadable-candle refusal', () => {
     assert.equal(res.exit.reason, exits.EXIT_REASONS.FILTER_FAIL);
   }
 });
+
+/* -------------------------------- a boolean setting, however it was STORED -- */
+
+test('"false" from a form is FALSE — Boolean(\'false\') is the bug this exists for', () => {
+  // Settings arrive from an HTML form as strings and every string is truthy, so
+  // `Boolean('false')` is `true`. A row written by a build whose route did not
+  // yet coerce a key — which is what happens whenever a new setting ships and the
+  // running app process is older than the code — stores "false", and every
+  // reader then sees the switch ON while the page renders it OFF.
+  //
+  // This actually happened to both §13.3 switches: turned off from the page,
+  // stored as "false", and they went on closing positions all the same.
+  for (const key of ['trendBreakExitEnabled', 'filterFailExitEnabled',
+    'emaFilterEnabled', 'emaExitOnCrossover', 'trailingStopEnabled',
+    'stopGuardEnabled', 'spotCheckEnabled']) {
+    const derived = settingsService.derive(settingsService.withDefaults({ [key]: 'false' }));
+    const seen = JSON.stringify(derived._rules ?? {}) + JSON.stringify(derived._ema ?? {})
+      + JSON.stringify(derived._spotCheck ?? {});
+    assert.ok(!seen.includes(`"${key}":true`),
+      `${key} stored as the string "false" must not derive as true`);
+  }
+});
+
+test('every spelling of off is off, and of on is on', () => {
+  const off = ['false', 'FALSE', ' false ', '0', 'no', 'off', false, 0];
+  const on = ['true', 'TRUE', '1', 'yes', 'on', true, 1];
+
+  for (const v of off) {
+    const d = settingsService.derive(settingsService.withDefaults({ trendBreakExitEnabled: v }));
+    assert.equal(d._rules.trendBreakExitEnabled, false, `${JSON.stringify(v)} must be OFF`);
+  }
+  for (const v of on) {
+    const d = settingsService.derive(settingsService.withDefaults({ trendBreakExitEnabled: v }));
+    assert.equal(d._rules.trendBreakExitEnabled, true, `${JSON.stringify(v)} must be ON`);
+  }
+});
+
+test('an absent or empty value falls back to the SHIPPED default, not to false', () => {
+  // The old `Boolean(undefined)` was false, which would silently turn a
+  // ships-ON safety filter off for any profile predating the key.
+  for (const v of [undefined, null, '']) {
+    const d = settingsService.derive(settingsService.withDefaults({ trendBreakExitEnabled: v }));
+    assert.equal(d._rules.trendBreakExitEnabled, true,
+      `${JSON.stringify(v)} must fall back to the shipped ON`);
+  }
+});

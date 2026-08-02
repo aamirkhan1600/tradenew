@@ -180,10 +180,40 @@ const DEFAULTS = {
   confirmed: [],
 };
 
+// A boolean setting, however it was stored.
+//
+// `Boolean(x)` is WRONG here and was wrong in nine places. Settings arrive from
+// an HTML form as strings, and every one of them is truthy: `Boolean('false')`
+// is `true`. A row written by a build whose route did not yet coerce a given key
+// — which is exactly what happens when a new setting ships and the running app
+// process is older than the code — stores the string "false", and every reader
+// then sees the switch as ON while the settings page renders it as OFF.
+//
+// That is not hypothetical: `trendBreakExitEnabled` and `filterFailExitEnabled`
+// were both turned off from the page, both stored as "false", and both went on
+// closing positions. The route-level coercion is still the right place to
+// normalise, but derive() must not DEPEND on it having happened.
+function boolOf(v, fallback = false) {
+  if (v === undefined || v === null || v === '') return fallback;
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v !== 0;
+  const t = String(v).trim().toLowerCase();
+  if (t === 'false' || t === '0' || t === 'no' || t === 'off') return false;
+  if (t === 'true' || t === '1' || t === 'yes' || t === 'on') return true;
+  return fallback;
+}
+
 function withDefaults(s) {
   const out = { ...(s || {}) };
   for (const [k, v] of Object.entries(DEFAULTS)) {
     if (out[k] === undefined || out[k] === null || out[k] === '') out[k] = v;
+    // Normalise EVERY boolean here rather than only in derive(). withDefaults()
+    // is what the settings PAGE renders from, and the page tests raw truthiness
+    // — `<%= settings.x ? 'selected' : '' %>`. A row holding the string "false"
+    // therefore rendered the switch as ON while the database said off and the
+    // engine, once boolOf() reached derive(), said off too: three readers, two
+    // answers. Fixing derive() alone left the page lying.
+    if (typeof v === 'boolean') out[k] = boolOf(out[k], v);
   }
   if (!Array.isArray(out.confirmed)) out.confirmed = [];
   return out;
@@ -567,8 +597,8 @@ function derive(raw) {
     // crossover EXIT must see identical averages, or a position gets closed
     // under a different indicator from the one that opened it.
     _ema: Object.freeze({
-      enabled: Boolean(s.emaFilterEnabled),
-      exitOnCrossover: Boolean(s.emaExitOnCrossover),
+      enabled: boolOf(s.emaFilterEnabled, true),
+      exitOnCrossover: boolOf(s.emaExitOnCrossover, true),
       emaFast: C.EMA_FAST,
       emaSlow: C.EMA_SLOW,
       emaFlatP: money.toPaise(s.emaFlatPoints),
@@ -581,7 +611,7 @@ function derive(raw) {
     // The shape ./spotGuard.js reads. Paise, converted once here, so no call
     // site can convert index points differently.
     _spotCheck: Object.freeze({
-      enabled: Boolean(s.spotCheckEnabled),
+      enabled: boolOf(s.spotCheckEnabled, true),
       maxDivergenceP: money.toPaise(s.spotCheckMaxDivergencePoints),
       minPairs: Math.trunc(Number(s.spotCheckMinPairs)),
     }),
@@ -604,27 +634,27 @@ function derive(raw) {
       rungP: money.toPaise(s.initialTargetPoints),
       targetExtensionPoints: Math.trunc(Number(s.targetExtensionPoints)),
       premiumSafetyExitPoints: Math.trunc(Number(s.premiumSafetyExitPoints)),
-      trailingStopEnabled: Boolean(s.trailingStopEnabled),
+      trailingStopEnabled: boolOf(s.trailingStopEnabled, true),
       // §16.4. Read by the safety timer, not by the candle cycle — the guard
       // exists precisely for the moments the candle cycle cannot see.
-      stopGuardEnabled: Boolean(s.stopGuardEnabled),
+      stopGuardEnabled: boolOf(s.stopGuardEnabled, true),
       maxHoldCandles: Math.trunc(Number(s.maxHoldCandles ?? C.MAX_HOLD_CANDLES)),
       liquidityMode: String(s.liquidityMode).toUpperCase(),
       premiumMinP: money.toPaise(s.premiumMin),
       premiumMaxP: money.toPaise(s.premiumMax),
       // ema.md §Position Exit Rule. Read by exits.onCandle(), which is handed
       // `_rules` and nothing else.
-      emaExitOnCrossover: Boolean(s.emaExitOnCrossover),
+      emaExitOnCrossover: boolOf(s.emaExitOnCrossover, true),
       // §13.3 as an exit, per half. Same channel: exits.onCandle() sees `_rules`.
-      trendBreakExitEnabled: Boolean(s.trendBreakExitEnabled),
-      filterFailExitEnabled: Boolean(s.filterFailExitEnabled),
+      trendBreakExitEnabled: boolOf(s.trendBreakExitEnabled, true),
+      filterFailExitEnabled: boolOf(s.filterFailExitEnabled, true),
     }),
 
     _risk: Object.freeze({
       maxOpenTrades: Math.trunc(Number(s.maxOpenTrades)),
       maxTradesPerDay: Math.trunc(Number(s.maxTradesPerDay)),
       maxConsecutiveLosses: Math.trunc(Number(s.maxConsecutiveLosses)),
-      tradeOnExpiryDay: Boolean(s.tradeOnExpiryDay),
+      tradeOnExpiryDay: boolOf(s.tradeOnExpiryDay, false),
     }),
   };
 
