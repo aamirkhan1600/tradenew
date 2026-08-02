@@ -58,6 +58,7 @@ const money = require('../src/core/money');
 const time = require('../src/core/time');
 const risk = require('../src/ose/risk');
 const settingsService = require('../src/ose/settings');
+const C = require('../src/ose/constants');
 const { OseEngine } = require('../src/ose/engine');
 const { STATES } = require('../src/ose/machine');
 const { OrderRouter } = require('../src/execution/orderRouter');
@@ -99,6 +100,21 @@ const FILL_ALL = process.argv.includes('--fill-all');
 // That is the honest counterfactual, and the gap between the two is the cost of
 // insisting on a price.
 const FILL_MARKET = process.argv.includes('--fill-market');
+
+// The two levers over the entry fill rate, overridable so the trade-off can be
+// MEASURED rather than argued about. `--offset` is the rupees above the option's
+// close the SELL limit is placed at (settings.entryOffset); `--fill-window` is
+// the milliseconds it waits before cancelling (§12.4's ENTRY_FILL_TIMEOUT_MS).
+// Both default to whatever the live configuration says, so an unflagged run is
+// unchanged.
+// §13.3 as an exit, off for this run only — so the desk can see what the strict
+// filter costs and earns before deciding to change the saved settings.
+const NO_TREND_BREAK = process.argv.includes('--no-trend-break');
+const NO_FILTER_FAIL = process.argv.includes('--no-filter-fail');
+// Kept as the shorthand for "neither half of §13.3 closes anything".
+const NO_FILTER_EXIT = process.argv.includes('--no-filter-exit');
+const OFFSET = argStr('offset', null);
+const FILL_WINDOW = arg('fill-window', null);
 
 const STEP_MS = 5000;
 const STRIKE_STEP = 50;
@@ -260,8 +276,49 @@ async function main() {
 
   if (!await db.healthCheck()) throw new Error('the database is not reachable');
 
+  // The overrides are applied by WRAPPING load(), not by patching the config
+  // object once. The engine re-reads its settings from the database on the first
+  // cycle and every 5s after (`_reloadSettings`), so an override written onto the
+  // first cfg is gone before the first candle — which is exactly what happened,
+  // and why a run with the flag set produced output identical to one without it.
+  if (NO_FILTER_EXIT || NO_TREND_BREAK || NO_FILTER_FAIL || OFFSET !== null) {
+    const _load = settingsService.load;
+    settingsService.load = async (...a) => {
+      const c = await _load.apply(settingsService, a);
+      // derive() freezes BOTH the config and each of its sub-blocks, and this
+      // file is not a module in strict mode — so `c._rules = ...` threw nothing,
+      // changed nothing, and produced a run byte-identical to the unflagged one.
+      // The override has to build a new object, not write into the frozen one.
+      const patch = {};
+      if (NO_FILTER_EXIT || NO_TREND_BREAK || NO_FILTER_FAIL) {
+        patch._rules = Object.freeze({
+          ...c._rules,
+          trendBreakExitEnabled: !(NO_FILTER_EXIT || NO_TREND_BREAK),
+          filterFailExitEnabled: !(NO_FILTER_EXIT || NO_FILTER_FAIL),
+        });
+      }
+      if (OFFSET !== null) {
+        patch.entryOffset = Number(OFFSET);
+        patch._entryOffsetP = money.toPaise(Number(OFFSET));
+      }
+      return Object.freeze({ ...c, ...patch });
+    };
+  }
+
   const cfg = await settingsService.load();
   LOT = (await settingsService.lotSizeFor(cfg.index)) || LOT;
+
+  if (NO_FILTER_EXIT || NO_TREND_BREAK) console.log('  §13.3 EXIT_TREND_BREAK DISABLED');
+  if (NO_FILTER_EXIT || NO_FILTER_FAIL) console.log('  §13.3 EXIT_FILTER_FAIL DISABLED');
+  if (OFFSET !== null) {
+    console.log(`  ENTRY OFFSET overridden: ₹${Number(OFFSET).toFixed(2)} above the option close`);
+  }
+  if (FILL_WINDOW !== null) {
+    // The engine reads this constant per entry, so replacing the property is
+    // enough — no engine change, and nothing persists past this process.
+    C.ENTRY_FILL_TIMEOUT_MS = Number(FILL_WINDOW);
+    console.log(`  ENTRY FILL WINDOW overridden: ${Number(FILL_WINDOW)}ms`);
+  }
   console.log(`  band ₹${(cfg._gate.premiumMinP / 100).toFixed(0)}–`
     + `${(cfg._gate.premiumMaxP / 100).toFixed(0)} · ${cfg.lots} lot(s) · `
     + `target ${cfg.initialTargetPoints} · stop ${cfg.initialStopPoints} · `

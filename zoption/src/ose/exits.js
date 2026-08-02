@@ -254,8 +254,11 @@ function onCandle({ trade, optionCandle, indexCandle, trend, ema = null, quote, 
   }
 
   /* 4 — the clock. `[MUST-CONFIRM #9]`. */
+  // 0 turns the time exit off. Without the `maxHold > 0` term the comparison
+  // below reads `candlesHeld >= 0`, which is true on the FIRST candle of every
+  // position — "disable the clock" would close every trade instantly.
   const maxHold = Math.trunc(cfg.maxHoldCandles ?? C.MAX_HOLD_CANDLES);
-  if (note('maxHold', (trade.candlesHeld || 0) >= maxHold)) {
+  if (note('maxHold', maxHold > 0 && (trade.candlesHeld || 0) >= maxHold)) {
     return fire(EXIT_REASONS.MAX_HOLD,
       `held for ${trade.candlesHeld} candles, the maximum is ${maxHold}`);
   }
@@ -277,9 +280,34 @@ function onCandle({ trade, optionCandle, indexCandle, trend, ema = null, quote, 
 
   /* 5 and 6 — the position validity filter. A trend break and a midpoint failure
      share priority 5 and are distinguished only by which one is reported; the
-     filter itself names the more specific of the two. */
+     filter itself names the more specific of the two.
+
+     §13.3 calls this "a strict, unforgiving filter ... the dominant driver of the
+     strategy's short holding period", and flags it "for desk awareness, not for
+     change". The two switches below are the desk taking that decision:
+     the thesis check still RUNS and is still recorded in `checks`, so the /ose
+     panel and the decision log can show how often it would have fired, but it no
+     longer closes the position. The trade then leaves only on its target ladder,
+     its stop, or one of the safety exits above — none of which this switch can
+     reach. */
   const valid = entry.stillValid(indexCandle, trend, trade.optionType);
-  if (note('validity', !valid.ok, valid.detail)) {
+
+  // The two halves are switched INDEPENDENTLY. §13.3 treats them as one rule and
+  // v3.0 gives them one priority, so this is a deliberate departure: a desk can
+  // decide that a trend flip is worth exiting on while an ordinary consolidation
+  // candle is not, which is the asymmetry §13.3's own design note describes.
+  //
+  // The unreadable-candle case is NOT one of the two. entry.stillValid() reports
+  // it as EXIT_FILTER_FAIL for want of a better code, but §3.8 is refusing to
+  // hold a naked short on absent information — it is a data-integrity exit
+  // wearing a thesis exit's name, and no operator switch may suppress it.
+  const unreadable = !indexCandle || !Number.isFinite(indexCandle.openP);
+  const allowed = unreadable
+    || (valid.reason === EXIT_REASONS.TREND_BREAK
+      ? cfg.trendBreakExitEnabled !== false
+      : cfg.filterFailExitEnabled !== false);
+
+  if (note('validity', !valid.ok, valid.detail) && allowed) {
     return fire(valid.reason, valid.detail);
   }
 

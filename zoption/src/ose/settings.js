@@ -75,6 +75,14 @@ const DEFAULTS = {
   targetExtensionPoints: 1,
   trailingStopEnabled: true,
   premiumSafetyExitPoints: 2,
+  // §16.2.6's holding-time cap, in 5s candles — 24 is two minutes. This was a
+  // DEAD control: exits.js read `cfg.maxHoldCandles ?? C.MAX_HOLD_CANDLES`, but
+  // derive() pinned the value to the constant, so the `??` never fell through
+  // and no operator number could reach it. Same defect as initialTargetPoints.
+  //
+  // 0 disables the time exit entirely; see the guard in exits.js, because a
+  // naive `candlesHeld >= 0` would close every position on its first candle.
+  maxHoldCandles: C.MAX_HOLD_CANDLES,
   reentryWaitCandles: 2,
   maxOpenTrades: 1,
   maxTradesPerDay: 30,
@@ -111,6 +119,19 @@ const DEFAULTS = {
   // `[MUST-CONFIRM #18]`.
   emaFilterEnabled: true,
   emaExitOnCrossover: true,
+  // §13.3's position validity filter, as an EXIT — split into its two halves so
+  // they can be turned independently. v3.0 gives them one priority and treats
+  // them as one rule; separating them is a deliberate departure, because the two
+  // are not equally severe. A trend flip says the direction the trade was sold
+  // into has reversed. A midpoint failure says this one candle consolidated —
+  // §13.3's own design note calls that "strict, unforgiving" and the reason the
+  // holding period is so short.
+  //
+  // Either off, the filter still EVALUATES and is still logged; it just does not
+  // close. Neither reaches a safety exit, and neither can suppress the
+  // unreadable-candle refusal (§3.8) that shares EXIT_FILTER_FAIL's code.
+  trendBreakExitEnabled: true,
+  filterFailExitEnabled: true,
   // Index POINTS, not premium points, and not paise. 0.25 is a quarter of one
   // NIFTY point — see EMA_FLAT_P in ./constants.js for why the band exists at all.
   emaFlatPoints: 0.25,
@@ -227,6 +248,7 @@ function validate(raw, { lotSize = FALLBACK_LOT } = {}) {
   wholeAtLeast('initialStopPoints', 1);
   wholeAtLeast('targetExtensionPoints', 1);
   wholeAtLeast('premiumSafetyExitPoints', 1);
+  wholeAtLeast('maxHoldCandles', 0);
   wholeAtLeast('reentryWaitCandles', 0);
   wholeAtLeast('maxTradesPerDay', 1);
   wholeAtLeast('maxConsecutiveLosses', 1);
@@ -399,6 +421,30 @@ function validate(raw, { lotSize = FALLBACK_LOT } = {}) {
       + 'the engine selling into a sideways tape. Turn it back on unless this is a deliberate, '
       + 'recorded comparison run.');
   }
+  if (Number(s.maxHoldCandles) === 0) {
+    warnings.push('maxHoldCandles is 0, so §16.2.6\'s holding-time exit is OFF: a position with no '
+      + 'target and no stop hit is held until the session square-off. Combined with a disabled '
+      + 'position-validity filter there is no longer any exit that fires on TIME at all.');
+  }
+  if (!s.trendBreakExitEnabled) {
+    warnings.push('trendBreakExitEnabled is OFF, so EXIT_TREND_BREAK no longer closes a position: '
+      + 'a short held into a REVERSED trend stays open until the target, the stop or a safety exit '
+      + 'takes it. This is the more severe half of §13.3 — the direction the trade was sold into '
+      + 'has gone against it, and the stop is now the only thing sizing that loss.');
+  }
+  if (!s.filterFailExitEnabled) {
+    warnings.push('filterFailExitEnabled is OFF, so EXIT_FILTER_FAIL no longer closes a position: '
+      + 'a candle that stops breaking its midpoint while the trend still holds is no longer an '
+      + 'exit. This is the milder half of §13.3 and the one its design note calls "strict, '
+      + 'unforgiving" — turning it off lengthens the hold without abandoning the direction. The '
+      + 'unreadable-candle refusal (§3.8) still fires; this switch cannot reach it.');
+  }
+  if (!s.trendBreakExitEnabled && !s.filterFailExitEnabled) {
+    warnings.push('BOTH halves of §13.3 are OFF, so no thesis failure closes a position at all. '
+      + 'Replaying 2026-07-30 in that configuration made all three two-hour windows worse, because '
+      + 'every loser then ran to the full stop instead of being cut early. Confirm initialStopPoints '
+      + 'is what you are willing to lose on every losing trade before running this live.');
+  }
   if (!s.emaExitOnCrossover) {
     warnings.push('emaExitOnCrossover is OFF, so ema.md\'s §Position Exit Rule is not enforced: a '
       + 'position whose EMA structure has inverted is held until the 3-candle trend break, the '
@@ -562,13 +608,16 @@ function derive(raw) {
       // §16.4. Read by the safety timer, not by the candle cycle — the guard
       // exists precisely for the moments the candle cycle cannot see.
       stopGuardEnabled: Boolean(s.stopGuardEnabled),
-      maxHoldCandles: C.MAX_HOLD_CANDLES,
+      maxHoldCandles: Math.trunc(Number(s.maxHoldCandles ?? C.MAX_HOLD_CANDLES)),
       liquidityMode: String(s.liquidityMode).toUpperCase(),
       premiumMinP: money.toPaise(s.premiumMin),
       premiumMaxP: money.toPaise(s.premiumMax),
       // ema.md §Position Exit Rule. Read by exits.onCandle(), which is handed
       // `_rules` and nothing else.
       emaExitOnCrossover: Boolean(s.emaExitOnCrossover),
+      // §13.3 as an exit, per half. Same channel: exits.onCandle() sees `_rules`.
+      trendBreakExitEnabled: Boolean(s.trendBreakExitEnabled),
+      filterFailExitEnabled: Boolean(s.filterFailExitEnabled),
     }),
 
     _risk: Object.freeze({

@@ -80,6 +80,28 @@
       <label>Premium safety exit (points)
         <input name="premiumSafetyExitPoints" type="number" step="1" min="1" value="<%= settings.premiumSafetyExitPoints %>">
       </label>
+      <label>Max hold (5s candles) <span class="hint">§16.2.6 — 24 = 2 min · 0 = no time exit</span>
+        <input name="maxHoldCandles" type="number" step="1" min="0" value="<%= settings.maxHoldCandles %>">
+      </label>
+      <!-- §13.3. The two exits this controls, EXIT_TREND_BREAK and
+           EXIT_FILTER_FAIL, are usually the two most common reasons a position
+           closes. Replaying 2026-07-30 with them off moved three separate
+           two-hour windows to a WORSE net result, because every loser then ran
+           to the full stop instead of being cut when its thesis failed. The
+           option is here because it is the desk's decision to make, not because
+           the measurement supports taking it. -->
+      <label>Trend-break exit <span class="hint">§13.3 — EXIT_TREND_BREAK</span>
+        <select name="trendBreakExitEnabled">
+          <option value="true"  <%= settings.trendBreakExitEnabled ? 'selected' : '' %>>ON — close when the trend flips against the short</option>
+          <option value="false" <%= settings.trendBreakExitEnabled ? '' : 'selected' %>>OFF — hold a reversed trend to the target or the stop</option>
+        </select>
+      </label>
+      <label>Midpoint-filter exit <span class="hint">§13.3 — EXIT_FILTER_FAIL</span>
+        <select name="filterFailExitEnabled">
+          <option value="true"  <%= settings.filterFailExitEnabled ? 'selected' : '' %>>ON — close when the candle stops breaking its midpoint</option>
+          <option value="false" <%= settings.filterFailExitEnabled ? '' : 'selected' %>>OFF — let a consolidation candle pass</option>
+        </select>
+      </label>
       <label>Trailing stop <span class="hint">§15.5</span>
         <select name="trailingStopEnabled">
           <option value="true"  <%= settings.trailingStopEnabled ? 'selected' : '' %>>ON — tighten the stop on every rung</option>

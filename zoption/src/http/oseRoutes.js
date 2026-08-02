@@ -68,7 +68,7 @@ const WATCH_FLAG = 'ose_watch';
 const NUMERIC = [
   'premiumMin', 'premiumMax', 'entryOffset',
   'initialTargetPoints', 'initialStopPoints', 'targetExtensionPoints',
-  'premiumSafetyExitPoints', 'reentryWaitCandles',
+  'premiumSafetyExitPoints', 'maxHoldCandles', 'reentryWaitCandles',
   'maxOpenTrades', 'maxTradesPerDay', 'maxConsecutiveLosses',
   'lots', 'scanRange', 'indexMinTicks', 'optionMinTicks',
   // newdoc/ema.md `[MUST-CONFIRM #18]`.
@@ -90,6 +90,10 @@ const BOOLEAN = [
   // would turn the strategy's first trend filter off without anyone deciding to.
   'emaFilterEnabled', 'emaExitOnCrossover',
   'spotCheckEnabled',
+  // §13.3 as an exit. In this list for the same reason as the two above: it
+  // ships ON, and a checkbox that can be ticked but never unticked is not a
+  // control. Turning it off is a risk decision — see the warning in settings.js.
+  'trendBreakExitEnabled', 'filterFailExitEnabled',
 ];
 
 function coerce(patch) {
