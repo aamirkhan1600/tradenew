@@ -76,8 +76,9 @@ router.get('/pfe/settings', auth.requirePage, wrap(async (req, res) => {
   // withDefaults, not the raw row: a profile written before a key existed must
   // still render a value rather than a blank input that saves as invalid.
   const settings = settingsService.withDefaults(await repo.settings.get(settingsService.PROFILE));
-  const { warnings } = settingsService.validate(settings);
-  const note = settingsService.breakevenNote(settings, 75);
+  const lotSize = await settingsService.lotSizeFor(settings.symbol);
+  const { warnings } = settingsService.validate(settings, { lotSize });
+  const note = settingsService.breakevenNote(settings, lotSize);
   res.render('pfeSettings', { page: 'pfe', settings, warnings, note });
 }));
 
@@ -294,10 +295,11 @@ api.get('/pnl', wrap(async (req, res) => {
 
 api.get('/settings', wrap(async (req, res) => {
   const raw = settingsService.withDefaults(await repo.settings.get(settingsService.PROFILE));
-  const { errors, warnings } = settingsService.validate(raw);
+  const lotSize = await settingsService.lotSizeFor(raw.symbol);
+  const { errors, warnings } = settingsService.validate(raw, { lotSize });
   res.json({
     ok: true, settings: raw, errors, warnings,
-    breakeven: settingsService.breakevenNote(raw, 75),
+    breakeven: settingsService.breakevenNote(raw, lotSize),
   });
 }));
 
@@ -324,7 +326,7 @@ api.post('/settings', wrap(async (req, res) => {
     ok: true,
     settings,
     warnings,
-    breakeven: settingsService.breakevenNote(settings, 75),
+    breakeven: settingsService.breakevenNote(settings, await settingsService.lotSizeFor(settings.symbol)),
   });
 }));
 

@@ -90,7 +90,7 @@ async function boot() {
       + 'Nothing reaches the exchange.');
   } else {
     logger.warn('engine: LIVE mode — orders will reach the exchange.');
-    const note = settingsService.breakevenNote(settings, 75);
+    const note = settingsService.breakevenNote(settings, await settingsService.lotSizeFor());
     if (!note.covered) {
       logger.warn('engine: the configured target does not cover the round-trip charges', {
         target: `₹${settings.target}`,

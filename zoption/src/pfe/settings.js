@@ -23,6 +23,14 @@ const { ValidationError } = require('../core/errors');
 
 const PROFILE = 'pfe';
 
+// Used ONLY when the instrument master cannot be reached. The engine itself
+// sizes real orders from the master (src/pfe/engine.js reads chosen.lotSize and
+// refuses a contract that has none), so this number never reaches an order — it
+// exists so the settings page and the boot log can render economics.
+//
+// NIFTY was 75 and is now 65. Every figure a human read here was ~15% off.
+const FALLBACK_LOT = 65;
+
 const EXPIRY_MODES = ['CURRENT_WEEKLY', 'NEXT_WEEKLY', 'MONTHLY', 'MANUAL'];
 const TRADE_MODES = ['BOTH', 'CE', 'PE'];
 const MODES = ['PAPER', 'LIVE'];
@@ -137,7 +145,7 @@ function withDefaults(s) {
 
 /* -------------------------------------------------------------- validate -- */
 
-function validate(raw) {
+function validate(raw, { lotSize = FALLBACK_LOT } = {}) {
   const s = withDefaults(raw);
   const errors = [];
   const warnings = [];
@@ -252,7 +260,7 @@ function validate(raw) {
   // THE number an operator has to see before a live session. doc/new.md's own
   // 1.0 / 2.0 needs to be right roughly seven times in ten before charges, and
   // charges are paid in full on winners and losers alike.
-  const qty = Math.max(1, Number(s.lots) * 75);
+  const qty = Math.max(1, Number(s.lots) * (Number(lotSize) || FALLBACK_LOT));
   const entryP = money.toPaise((Number(s.premiumIdealMin) + Number(s.premiumIdealMax)) / 2)
     + money.toPaise(s.sellOffset);
   const need = money.requiredWinRate({
@@ -442,8 +450,8 @@ function derive(raw) {
 // read. Deliberately says what it does not cover: a ladder that reaches its
 // fourth confirmation changes these numbers completely, and quoting the first
 // rung as if it were the strategy's expectancy would be its own kind of lie.
-function breakevenNote(s, lotSize = 75) {
-  const qty = Math.max(1, Number(s.lots) * Number(lotSize || 75));
+function breakevenNote(s, lotSize = FALLBACK_LOT) {
+  const qty = Math.max(1, Number(s.lots) * Number(lotSize || FALLBACK_LOT));
   const entryP = money.toPaise((Number(s.premiumIdealMin) + Number(s.premiumIdealMax)) / 2)
     + money.toPaise(s.sellOffset);
   const be = money.breakevenPaise({
@@ -478,13 +486,23 @@ function breakevenNote(s, lotSize = 75) {
 
 /* ------------------------------------------------------------------- I/O -- */
 
+// The contract size the exchange is using, or the fallback when the master is
+// unreachable. Read once per settings load, not per cycle.
+async function lotSizeFor(underlying = 'NIFTY') {
+  try {
+    return (await repo.instruments.lotSize(underlying)) || FALLBACK_LOT;
+  } catch (_) {
+    return FALLBACK_LOT;
+  }
+}
+
 async function load(name = PROFILE) {
   const raw = await repo.settings.get(name);
   if (!raw) {
     throw new ValidationError(
       `the "${name}" settings profile does not exist — run npm run migrate`);
   }
-  const { errors, warnings } = validate(raw);
+  const { errors, warnings } = validate(raw, { lotSize: await lotSizeFor(raw?.symbol) });
   if (errors.length) {
     throw new ValidationError(`the Price Filter settings are invalid:\n  - ${errors.join('\n  - ')}`);
   }
@@ -496,7 +514,7 @@ async function save(name, patch) {
   const current = (await repo.settings.get(name)) || {};
   const merged = withDefaults({ ...current, ...patch });
   delete merged._name; delete merged._version; delete merged._updatedAt;
-  const { errors, warnings } = validate(merged);
+  const { errors, warnings } = validate(merged, { lotSize: await lotSizeFor(merged.symbol) });
   if (errors.length) {
     throw new ValidationError(`the Price Filter settings are invalid:\n  - ${errors.join('\n  - ')}`);
   }
@@ -506,5 +524,5 @@ async function save(name, patch) {
 
 module.exports = {
   PROFILE, DEFAULTS, EXPIRY_MODES, TRADE_MODES, MODES,
-  withDefaults, validate, derive, breakevenNote, load, save,
+  withDefaults, validate, derive, breakevenNote, load, save, lotSizeFor, FALLBACK_LOT,
 };

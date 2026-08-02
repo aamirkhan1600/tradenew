@@ -80,7 +80,11 @@ const TRADE_MODES = ['BOTH', 'CE', 'PE'];
 const CYCLE_SCOPES = ['BOTH_LEGS', 'PER_LEG'];
 const MODES = ['PAPER', 'LIVE'];
 
-function validate(raw) {
+// Used ONLY when the instrument master cannot be reached — this profile names no
+// underlying, so it is NIFTY by construction. NIFTY was 75 and is now 65.
+const FALLBACK_LOT = 65;
+
+function validate(raw, { lotSize = FALLBACK_LOT } = {}) {
   const s = withDefaults(raw);
   const errors = [];
   const warnings = [];
@@ -195,7 +199,7 @@ function validate(raw) {
   // configuration as "covered" because 1.00 > the ~0.65 of charges, which reads
   // as reassurance for a setup that has to be right 88% of the time.
   if (!errors.length) {
-    const qty = Math.max(1, Number(s.lots) * 75);          // NIFTY lot, for the estimate
+    const qty = Math.max(1, Number(s.lots) * (Number(lotSize) || FALLBACK_LOT));
     const entryP = money.toPaise(s.targetPremium || 12) + money.toPaise(s.sellOffset);
     const need = money.requiredWinRate({
       entryPaise: entryP, qty,
@@ -406,7 +410,7 @@ function derive(raw) {
 // target on one lot is mostly charges; saying so at boot is cheaper than
 // discovering it from a week of "winning" trades that lost money.
 function breakevenNote(s, lotSize) {
-  const qty = Math.max(1, Number(s.lots) * Number(lotSize || 75));
+  const qty = Math.max(1, Number(s.lots) * Number(lotSize || FALLBACK_LOT));
   const entryP = money.toPaise(s.targetPremium || 12) + money.toPaise(s.sellOffset);
   const be = money.breakevenPaise({ entryPaise: entryP, qty, assumeTargetPaise: money.toPaise(s.target) });
   const need = money.requiredWinRate({
@@ -429,10 +433,20 @@ function breakevenNote(s, lotSize) {
   };
 }
 
+// The contract size the exchange is using, or the fallback when the master is
+// unreachable. Read once per settings load, not per cycle.
+async function lotSizeFor(underlying = 'NIFTY') {
+  try {
+    return (await repo.instruments.lotSize(underlying)) || FALLBACK_LOT;
+  } catch (_) {
+    return FALLBACK_LOT;
+  }
+}
+
 async function load(name = 'default') {
   const raw = await repo.settings.get(name);
   if (!raw) throw new ValidationError(`settings profile "${name}" does not exist — run npm run migrate`);
-  const { errors, warnings } = validate(raw);
+  const { errors, warnings } = validate(raw, { lotSize: await lotSizeFor() });
   if (errors.length) {
     throw new ValidationError(`the settings are invalid:\n  - ${errors.join('\n  - ')}`);
   }
@@ -447,7 +461,7 @@ async function save(name, patch) {
   // settings page shows real values rather than blanks.
   const merged = withDefaults({ ...current, ...patch });
   delete merged._name; delete merged._version; delete merged._updatedAt;
-  const { errors, warnings } = validate(merged);
+  const { errors, warnings } = validate(merged, { lotSize: await lotSizeFor() });
   if (errors.length) {
     throw new ValidationError(`the settings are invalid:\n  - ${errors.join('\n  - ')}`);
   }
@@ -457,5 +471,5 @@ async function save(name, patch) {
 
 module.exports = {
   EXPIRY_MODES, STRIKE_MODES, TRADE_MODES, CYCLE_SCOPES, MODES, TREND_DEFAULTS,
-  withDefaults, validate, derive, breakevenNote, load, save,
+  withDefaults, validate, derive, breakevenNote, load, save, lotSizeFor, FALLBACK_LOT,
 };

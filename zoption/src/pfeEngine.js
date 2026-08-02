@@ -99,7 +99,7 @@ async function boot() {
       + 'Nothing reaches the exchange.');
   } else {
     logger.warn('pfe: LIVE mode — orders will reach the exchange.');
-    reportEconomics(settings);
+    reportEconomics(settings, await settingsService.lotSizeFor(settings.symbol));
   }
 
   ticker = new Ticker({ session, label: 'pfe' });
@@ -159,8 +159,10 @@ async function boot() {
 // the losing side of a risk/reward before charges are considered at all, and the
 // whole strategy rests on the ladder making that back — so both numbers are
 // printed, not just the flattering one.
-function reportEconomics(settings) {
-  const note = settingsService.breakevenNote(settings, 75);
+// `lotSize` is a parameter rather than looked up here: this function is sync and
+// the master read is not, and an `await` in a non-async function is a parse error.
+function reportEconomics(settings, lotSize) {
+  const note = settingsService.breakevenNote(settings, lotSize);
   if (!note.covered) {
     logger.warn('pfe: the first rung does not cover the round-trip charges', {
       target: `₹${settings.target}`,
