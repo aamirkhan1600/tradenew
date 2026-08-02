@@ -116,7 +116,7 @@ async function boot() {
       + 'NOT simulated, so paper results are an optimistic bound.');
   } else {
     logger.warn('ose: LIVE mode — orders will reach the exchange.');
-    reportEconomics(settings);
+    reportEconomics(settings, await settingsService.lotSizeFor(settings.index));
     await reportMargin(settings);
   }
 
@@ -191,8 +191,12 @@ function reportUnsigned(settings) {
 // §17.3.1. Charges are per ROUND TRIP and dominated by a flat brokerage, so a
 // one-point target at one lot can be a guaranteed loss before the market is
 // consulted at all. Both numbers are printed, not just the flattering one.
-function reportEconomics(settings) {
-  const note = settingsService.breakevenNote(settings, 75);
+// `lotSize` is passed in rather than looked up here, so this stays synchronous
+// and the caller does the one await. It is the size the EXCHANGE is using, from
+// the instrument master — NIFTY moved 75 -> 65, and hardcoding the old value
+// reported the boot economics on 15% more quantity than the engine would send.
+function reportEconomics(settings, lotSize) {
+  const note = settingsService.breakevenNote(settings, lotSize);
   if (!note.covered) {
     logger.error('ose: THE FIRST RUNG DOES NOT COVER THE ROUND-TRIP CHARGES', {
       target: `₹${settings.initialTargetPoints}`,

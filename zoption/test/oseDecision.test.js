@@ -300,3 +300,137 @@ test('§10 always reaches a verdict where paralle.md §Step 3 would abstain', ()
     `§10 abstained on ${nulls} of 2000 random windows — it should abstain only on a `
     + 'perfect tie. A high count means the HH+HL+HC rule has been substituted.');
 });
+
+/* ================= §14.1 — the rung is configurable, and one thing ========= */
+
+// `initialTargetPoints` used to be pinned to 1, because §14.1 writes the ladder
+// as "level k: entryPrice − k points" and the code hardcoded a point. The desk
+// asked for a half-point target, so the rung is a parameter now — and the whole
+// ladder has to move together: the targets, the trail and §15.2's locked-in
+// progression are all expressed in rungs.
+test('ladder: the rung sizes the targets AND the trail, together', () => {
+  const settings = require('../src/ose/settings');
+  const entry = 4000;                                   // ₹40.00
+
+  for (const [points, targets, trails] of [
+    [1, [3900, 3800, 3700], [4000, 3900, 3800]],
+    [0.5, [3950, 3900, 3850], [4000, 3950, 3900]],
+    [2, [3800, 3600, 3400], [4000, 3800, 3600]],
+  ]) {
+    const cfg = settings.derive(settings.withDefaults({ initialTargetPoints: points }));
+    for (let k = 1; k <= 3; k += 1) {
+      assert.equal(ladder.targetPriceFor(entry, k, cfg._rungP), targets[k - 1],
+        `rung ${points}: target at level ${k}`);
+      const t = ladder.trailStop({ entryPriceP: entry, stopPriceP: entry + 200 }, k, cfg._rules);
+      assert.equal(t ? t.stopPriceP : null, trails[k - 1],
+        `rung ${points}: the stop after achieving level ${k}`);
+    }
+  }
+});
+
+test('ladder: §15.2 still locks (k−1) RUNGS, whatever a rung is worth', () => {
+  // The table in §15.2 reads "level 1 -> breakeven, level 2 -> +1, level k ->
+  // +(k−1)". Those are rungs, not points, and the two only coincided while a
+  // rung was hardcoded to a point.
+  const settings = require('../src/ose/settings');
+  const cfg = settings.derive(settings.withDefaults({ initialTargetPoints: 0.5 }));
+  const entry = 4000;
+
+  const atOne = ladder.trailStop({ entryPriceP: entry, stopPriceP: entry + 200 }, 1, cfg._rules);
+  assert.equal(atOne.stopPriceP, entry, 'level 1 is breakeven at any rung');
+  assert.equal(atOne.lockedPointsP, 0);
+
+  const atThree = ladder.trailStop({ entryPriceP: entry, stopPriceP: entry + 200 }, 3, cfg._rules);
+  assert.equal(atThree.lockedPointsP, 2 * cfg._rungP, 'level 3 locks two rungs');
+});
+
+test('settings: a rung that is not a whole TICK is refused', () => {
+  // An off-tick rung puts an off-tick price on a target, and the exchange
+  // rejects those outright.
+  const settings = require('../src/ose/settings');
+  // Asserted on the PRESENCE of the tick error, not on the error list being
+  // empty. A rung also has to clear its own charges, and that rule depends on
+  // the charge schedule — which `test/helpers.js` deliberately sets punitive.
+  // Coupling the two would make this test fail whenever the schedule changed,
+  // for a reason that has nothing to do with ticks.
+  const TICK_ERROR = /multiple of the 0\.05 tick/;
+
+  const bad = settings.validate(settings.withDefaults({ initialTargetPoints: 0.07 }));
+  assert.ok(bad.errors.some(e => TICK_ERROR.test(e)),
+    `expected a tick error, got: ${bad.errors.join(' | ') || '(none)'}`);
+
+  for (const good of [0.5, 1, 2.5]) {
+    const r = settings.validate(settings.withDefaults({ initialTargetPoints: good }));
+    assert.ok(!r.errors.some(e => TICK_ERROR.test(e)), `${good} is a whole number of ticks`);
+  }
+});
+
+test('settings: a rung too small to clear its own charges is refused outright', () => {
+  // An ERROR rather than a warning, because a "winning" trade that books a loss
+  // is not a configuration anyone chose on purpose. §17.3 counts a loss on NET,
+  // so a target under the charges makes the circuit breaker fire on wins.
+  const settings = require('../src/ose/settings');
+
+  const tiny = settings.validate(settings.withDefaults({ initialTargetPoints: 0.05, lots: 1 }));
+  assert.ok(tiny.errors.some(e => /LOSES money/.test(e)),
+    `expected the charges refusal, got: ${tiny.errors.join(' | ') || '(no errors)'}`);
+
+  // A rung big enough to pay for itself is accepted — the rule is about the
+  // rung against the charges, not about small rungs being banned.
+  const viable = settings.validate(settings.withDefaults({ initialTargetPoints: 2.5, lots: 1 }));
+  assert.ok(!viable.errors.some(e => /LOSES money/.test(e)),
+    `2.5 points should clear the charges: ${viable.errors.join(' | ')}`);
+});
+
+test('ladder: the rung defaults to one point when nothing is passed', () => {
+  // Every existing caller and every script that builds a cfg by hand relies on
+  // this — the parameter was added under them.
+  assert.equal(ladder.targetPriceFor(4000, 1), 3900);
+  assert.equal(ladder.targetPriceFor(4000, 3), 3700);
+  const t = ladder.trailStop({ entryPriceP: 4000, stopPriceP: 4200 }, 2, {});
+  assert.equal(t.stopPriceP, 3900, 'level 2 locks one point with no rung configured');
+});
+
+/* ============ the lot size comes from the master, never from a constant ==== */
+
+// NIFTY moved from 75 to 65 and the number was hardcoded in five places. The
+// ENGINE was always right — it sizes from `quote.lotSize` — so the defect was
+// the worse way round: every figure a HUMAN read (the settings page's
+// break-even panel, preflight's economics, the "a winning trade loses money"
+// refusal) was computed on 15% more quantity than would ever be sent.
+test('settings: the break-even panel sizes on the lot it is given, not on 75', () => {
+  const settings = require('../src/ose/settings');
+  const cfg = settings.withDefaults({ lots: 2 });
+
+  const at65 = settings.breakevenNote(cfg, 65);
+  const at75 = settings.breakevenNote(cfg, 75);
+
+  assert.equal(at65.qty, 130, '2 lots of 65');
+  assert.equal(at75.qty, 150, '2 lots of 75');
+  assert.notEqual(at65.winP, at75.winP, 'the economics must move with the contract size');
+});
+
+test('settings: validate sizes on the real lot too, so the charges refusal is honest', () => {
+  // §17.3 counts a loss on NET. A target that clears the charges at 75 but not
+  // at 65 has to be refused at 65 — validating on the larger lot would let a
+  // configuration through that books a loss on every "winning" trade.
+  const settings = require('../src/ose/settings');
+  const small = { initialTargetPoints: 0.5, lots: 1 };
+
+  const strict = settings.validate(settings.withDefaults(small), { lotSize: 65 });
+  const loose = settings.validate(settings.withDefaults(small), { lotSize: 900 });
+
+  assert.ok(strict.errors.some(e => /LOSES money/.test(e)),
+    'at 65 a half-point win does not cover the charges');
+  assert.ok(!loose.errors.some(e => /LOSES money/.test(e)),
+    'at a large enough size the same target does — so the check is reading the lot');
+});
+
+test('settings: the fallback is only a fallback, and it is the CURRENT lot', () => {
+  const settings = require('../src/ose/settings');
+  assert.equal(settings.FALLBACK_LOT, 65,
+    'the fallback must track the exchange, or an unreachable master silently '
+    + 'restores the old wrong number');
+  // Called with nothing, it must still size on something real.
+  assert.equal(settings.breakevenNote(settings.withDefaults({ lots: 1 })).qty, 65);
+});

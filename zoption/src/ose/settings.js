@@ -45,6 +45,15 @@ const { ValidationError } = require('../core/errors');
 
 const PROFILE = 'ose';
 
+// Used ONLY when the instrument master cannot be reached — a settings page that
+// renders no economics at all is worse than one that renders approximate ones,
+// but the approximation has to be visible. Every caller that can reach the
+// master passes the real value instead.
+//
+// NIFTY was 75 and is now 65. That number was hardcoded in five places, and the
+// engine (which sizes from the master) disagreed with every figure a human read.
+const FALLBACK_LOT = 65;
+
 // The last warning set logged per profile — see load(). Module-scoped because the
 // engine reloads settings every five seconds through a fresh call.
 const _lastWarned = new Map();
@@ -161,7 +170,7 @@ function withDefaults(s) {
 
 /* -------------------------------------------------------------- validate -- */
 
-function validate(raw) {
+function validate(raw, { lotSize = FALLBACK_LOT } = {}) {
   const s = withDefaults(raw);
   const errors = [];
   const warnings = [];
@@ -199,27 +208,22 @@ function validate(raw) {
       errors.push(`${field} must be a whole number of ${min} or more`);
     }
   };
-  // §14.1 fixes the rung spacing: "level k: entryPrice − k points". The first
-  // target is therefore ALWAYS one point below the fill, and `ladder.targetPriceFor`
-  // implements exactly that — it takes a level, not a point count.
+  // §14.1 writes the ladder as "level k: entryPrice − k points", which fixes the
+  // rung at one point. This is now a REAL control — the desk asked for a
+  // half-point target — and `ladder.targetPriceFor` takes the rung as a
+  // parameter, so the whole ladder, the trail and the locked-in progression
+  // follow it together.
   //
-  // §5.1 nevertheless lists this as tunable with `>= 1`, and the two cannot both
-  // be true. Until this was pinned, setting it to 3 changed the break-even panel
-  // on the settings page — which reads it — and changed NOTHING about the engine,
-  // which does not. The page would tell an operator a 3-point target needs a 41%
-  // win rate while the engine kept taking 1 point. A control that reports
-  // different economics from the ones being executed is worse than no control.
-  //
-  // Pinned rather than wired: making the ladder honour it would change §14.1's
-  // rung spacing, which is a specification decision and not a validation one.
-  // `targetExtensionPoints` is the knob that genuinely moves the ladder — it is
-  // read by `ladder.advanceTarget` and steps the rung by that many points.
-  if (Number(s.initialTargetPoints) !== 1) {
-    errors.push('initialTargetPoints must be 1 — §14.1 fixes the ladder at one point per rung '
-      + '("level k: entryPrice − k points") and the engine takes its first target from that, not '
-      + 'from this field. Any other value would change only the break-even figures on this page '
-      + 'and not a single order. Use targetExtensionPoints to move the ladder.');
+  // Constrained to a multiple of the 5-paise TICK. An off-tick rung would put an
+  // off-tick price on a target, and the exchange rejects those outright.
+  const rungP = money.toPaise(s.initialTargetPoints);
+  if (!Number.isFinite(rungP) || rungP < C.TICK) {
+    errors.push(`initialTargetPoints must be at least ${C.TICK / 100} — one exchange tick`);
+  } else if (rungP % C.TICK !== 0) {
+    errors.push(`initialTargetPoints ${s.initialTargetPoints} is not a multiple of the `
+      + `${C.TICK / 100} tick, so a target would land on a price the exchange rejects`);
   }
+
   wholeAtLeast('initialStopPoints', 1);
   wholeAtLeast('targetExtensionPoints', 1);
   wholeAtLeast('premiumSafetyExitPoints', 1);
@@ -287,7 +291,7 @@ function validate(raw) {
 
   /* --- warnings: legal, but the operator should have read them ------------ */
 
-  const qty = Math.max(1, Number(s.lots) * 75);
+  const qty = Math.max(1, Number(s.lots) * (Number(lotSize) || FALLBACK_LOT));
   // The middle of the premium band plus the offset — the price a typical entry
   // actually fills at, which is what the economics have to be measured against.
   const entryP = money.toPaise((Number(s.premiumMin) + Number(s.premiumMax)) / 2) + offsetP;
@@ -458,6 +462,14 @@ function validate(raw) {
       + 'each direction. A feed that flaps would spend the session warming up.');
   }
 
+  if (Number(s.initialTargetPoints) < 1) {
+    warnings.push(`initialTargetPoints is ${s.initialTargetPoints}, so every rung of the ladder `
+      + `is ${s.initialTargetPoints} points — the first target, every extension and the trailing `
+      + 'stop all move together. A smaller rung wins more often and wins less each time, and it '
+      + 'does NOT reduce the loss: the stop is still initialStopPoints away. Read the break-even '
+      + 'figure above before trading it.');
+  }
+
   const unsigned = C.MUST_CONFIRM_IDS.filter(id => !(s.confirmed || []).map(Number).includes(id));
   if (unsigned.length) {
     warnings.push(`§22: ${unsigned.length} of ${C.MUST_CONFIRM_IDS.length} MUST-CONFIRM items `
@@ -488,7 +500,10 @@ function derive(raw) {
     _premiumMaxP: money.toPaise(s.premiumMax),
     _entryOffsetP: money.toPaise(s.entryOffset),
 
-    _initialTargetP: Math.trunc(Number(s.initialTargetPoints)) * C.POINT,
+    // One rung, in paise. THE number the ladder is built on — see
+    // ladder.targetPriceFor.
+    _rungP: money.toPaise(s.initialTargetPoints),
+    _initialTargetP: money.toPaise(s.initialTargetPoints),
     _initialStopP: Math.trunc(Number(s.initialStopPoints)) * C.POINT,
 
     // The shape ./strikes.js and ./exits.js read. Built once here so no call
@@ -538,6 +553,9 @@ function derive(raw) {
 
     // The shape ./exits.js and ./ladder.js read.
     _rules: Object.freeze({
+      // The ladder's rung. `targetExtensionPoints` is how many RUNGS an
+      // extension advances; this is how big a rung is.
+      rungP: money.toPaise(s.initialTargetPoints),
       targetExtensionPoints: Math.trunc(Number(s.targetExtensionPoints)),
       premiumSafetyExitPoints: Math.trunc(Number(s.premiumSafetyExitPoints)),
       trailingStopEnabled: Boolean(s.trailingStopEnabled),
@@ -605,9 +623,9 @@ function assertLiveAllowed(s) {
 // read. Deliberately reports what it does NOT cover: a trade that reaches its
 // fourth rung has completely different numbers, and quoting the first rung as if
 // it were the strategy's expectancy would be its own kind of lie.
-function breakevenNote(s, lotSize = 75) {
+function breakevenNote(s, lotSize = FALLBACK_LOT) {
   const w = withDefaults(s);
-  const qty = Math.max(1, Number(w.lots) * Number(lotSize || 75));
+  const qty = Math.max(1, Number(w.lots) * Number(lotSize || FALLBACK_LOT));
   const entryP = money.toPaise((Number(w.premiumMin) + Number(w.premiumMax)) / 2)
     + money.toPaise(w.entryOffset);
 
@@ -643,13 +661,24 @@ function breakevenNote(s, lotSize = 75) {
 
 /* ------------------------------------------------------------------- I/O -- */
 
+// The contract size the exchange is using, or the fallback when the master is
+// unreachable. Small and cached-free on purpose: it is read once per settings
+// load, not per cycle.
+async function lotSizeFor(underlying = 'NIFTY') {
+  try {
+    return (await repo.instruments.lotSize(underlying)) || FALLBACK_LOT;
+  } catch (_) {
+    return FALLBACK_LOT;
+  }
+}
+
 async function load(name = PROFILE) {
   const raw = await repo.settings.get(name);
   if (!raw) {
     throw new ValidationError(
       `the "${name}" settings profile does not exist — run npm run migrate`);
   }
-  const { errors, warnings } = validate(raw);
+  const { errors, warnings } = validate(raw, { lotSize: await lotSizeFor(raw?.index) });
   if (errors.length) {
     throw new ValidationError(
       `the Option Selling Engine settings are invalid:\n  - ${errors.join('\n  - ')}`);
@@ -681,7 +710,7 @@ async function save(name, patch) {
   const merged = withDefaults({ ...current, ...patch });
   delete merged._name; delete merged._version; delete merged._updatedAt;
 
-  const { errors, warnings } = validate(merged);
+  const { errors, warnings } = validate(merged, { lotSize: await lotSizeFor(merged.index) });
   if (errors.length) {
     throw new ValidationError(
       `the Option Selling Engine settings are invalid:\n  - ${errors.join('\n  - ')}`);
@@ -693,6 +722,6 @@ async function save(name, patch) {
 module.exports = {
   PROFILE, DEFAULTS, MODES, LIQUIDITY_MODES, SYNTHETIC_MODES,
   withDefaults, validate, derive,
-  unsignedItems, assertLiveAllowed, breakevenNote,
+  unsignedItems, assertLiveAllowed, breakevenNote, lotSizeFor, FALLBACK_LOT,
   load, save,
 };

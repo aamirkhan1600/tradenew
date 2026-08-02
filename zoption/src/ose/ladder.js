@@ -53,9 +53,21 @@ function entryPrice(candle, entryOffsetPaise, tickPaise = C.TICK) {
 // itself: the most a short at E can make is E, so the deepest reachable rung is
 // floor(entryPrice / POINT), and PREMIUM_FLOOR closes the position before it
 // gets there anyway.
-function targetPriceFor(entryPriceP, level) {
+// `rungP` — the size of ONE rung in paise. Defaults to §14.1's one point, which
+// is what it was hardcoded to before this was a parameter.
+//
+// §14.1 writes the ladder as "level k: entryPrice − k points", and read literally
+// that fixes the rung at exactly one point. It is a parameter now because the
+// desk asked for a half-point target, and the ladder is the only thing that
+// decides what a "point" means here: everything else — the trail, the locked-in
+// progression, the target-reached test — is expressed in rungs and follows.
+//
+// The rung is validated as a multiple of the 5-paise tick, so a target price can
+// never be off-tick and be rejected by the exchange.
+function targetPriceFor(entryPriceP, level, rungP = C.POINT) {
   const k = Math.max(0, Math.trunc(level));
-  return entryPriceP - k * C.POINT;
+  const rung = Math.max(1, Math.round(rungP || C.POINT));
+  return entryPriceP - k * rung;
 }
 
 // §14.3 — "a sealed option candle whose close is at or beyond the current target
@@ -88,7 +100,7 @@ function advanceTarget(trade, candle, cfg = {}) {
   const level = Math.trunc(trade.targetLevel || 0) + extension;
   return {
     targetLevel: level,
-    targetPriceP: targetPriceFor(trade.entryPriceP, level),
+    targetPriceP: targetPriceFor(trade.entryPriceP, level, cfg.rungP),
   };
 }
 
@@ -124,7 +136,11 @@ function trailStop(trade, level, cfg = {}) {
   const k = Math.trunc(level);
   if (k < 1) return null;
 
-  const candidate = trade.entryPriceP - (k - 1) * C.POINT;
+  // The same rung the TARGET ladder uses. If the two ever disagreed, §15.2's
+  // "level k locks +(k−1)" would stop being true and the trail would either give
+  // away profit or claim protection it does not have.
+  const rung = Math.max(1, Math.round(cfg.rungP || C.POINT));
+  const candidate = trade.entryPriceP - (k - 1) * rung;
   const next = Math.min(trade.stopPriceP, candidate);
 
   if (next > trade.stopPriceP) {

@@ -163,7 +163,8 @@ async function main() {
       + 'stop instead.');
   } else pass('EMA crossover exit', 'ON — an inverted EMA structure closes the position');
 
-  const note = settingsService.breakevenNote(cfg, 75);
+  const lotSize = await settingsService.lotSizeFor(cfg.index);
+  const note = settingsService.breakevenNote(cfg, lotSize);
   const rate = note.requiredWinRate == null ? null : Math.round(note.requiredWinRate * 100);
   if (rate == null) fail('first rung clears charges', 'a winning trade still books a loss at this size');
   else if (rate >= 60) {

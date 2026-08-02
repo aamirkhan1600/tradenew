@@ -5,6 +5,16 @@
 //   node scripts/ose-replay.js --minutes 60 --seed 7 --vol 3
 //   node scripts/ose-replay.js --trades            print every trade
 //
+//   --history 2026-07-31 --start 09:20             replay a REAL session's index
+//                                                  path instead of a random walk
+//   --fill-market                                  take every signal at the
+//                                                  prevailing premium (a market
+//                                                  entry) rather than waiting for
+//                                                  the limit to be reached
+//   --fill-all                                     fill every entry AT its limit.
+//                                                  An upper bound nobody can
+//                                                  reach — see FILL_ALL below
+//
 // The engine is REAL — the decision cycle, the strike selector, the ladder, the
 // exits, the order router, the paper broker and every `ose_*` table. What is
 // synthetic is the market: an index path and an option chain priced off it.
@@ -59,14 +69,44 @@ const arg = (name, fallback) => {
   return i > -1 && process.argv[i + 1] ? Number(process.argv[i + 1]) : fallback;
 };
 const MINUTES = arg('minutes', 30);
+// Replay a REAL session instead of a random walk:
+//   --history 2026-07-31 --start 09:20 --minutes 30
+const argStr = (name, fallback) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > -1 && process.argv[i + 1] ? String(process.argv[i + 1]) : fallback;
+};
+const HISTORY = argStr('history', null);
+const START = argStr('start', '09:20');
 const SEED = arg('seed', 1);
 const VOL = arg('vol', 2.5);          // index points of noise per 5s bar
 const DRIFT = arg('drift', 0);        // points per bar of trend
 const SHOW_TRADES = process.argv.includes('--trades');
+// Force every entry to fill at its own limit price.
+//
+// Not realism — a counterfactual. A SELL limit at `close + offset` only fills
+// when the premium ticks UP, and for a short that is the trade starting against
+// you; the ones that never fill are the ones where the premium fell straight
+// away, which is what the strategy is trying to catch. So the fill rule
+// ADVERSELY SELECTS, and this measures how much that costs by removing it.
+const FILL_ALL = process.argv.includes('--fill-all');
+// The ATTAINABLE 100% fill: take every signal, but at the price the market is
+// actually showing rather than at a limit it never traded through.
+//
+// `--fill-all` is an upper bound nobody can reach — it fills at `close + offset`
+// even when the premium fell straight away and never came back. A MARKET entry
+// is how you would really take those trades, and it pays for them: you get the
+// prevailing premium, which on exactly those trades is LOWER than the limit.
+// That is the honest counterfactual, and the gap between the two is the cost of
+// insisting on a price.
+const FILL_MARKET = process.argv.includes('--fill-market');
 
 const STEP_MS = 5000;
 const STRIKE_STEP = 50;
 const SPOT0 = 2438360;                // paise — where the real index actually is
+// The contract size the replay prices on. Resolved from the instrument master at
+// startup rather than hardcoded: NIFTY moved from 75 to 65, and a replay sized
+// on 75 overstates every P&L figure it reports by about 15%.
+let LOT = 65;
 
 // Deterministic PRNG. `Math.random` would make a replay unrepeatable, which
 // defeats the point of a replay.
@@ -98,7 +138,7 @@ function chainAt(spotP, expiry) {
     for (const type of ['CE', 'PE']) {
       out.push({
         token: `${k}${type}`, segment: 'nse_fo', symbol: `SIM${k}${type}`,
-        strike: k, optionType: type, expiry, lotSize: 75, tickP: 5,
+        strike: k, optionType: type, expiry, lotSize: LOT, tickP: 5,
         ltpP: premiumP(k, type, spotP),
         bidP: null, askP: null, spreadP: null, midP: null,
         bidQty: null, askQty: null, oi: null, volume: null, snapshotTs: Date.now(),
@@ -114,6 +154,104 @@ const bar = (token, o, h, l, c, ts) => ({
   tickCount: 5, synthetic: false, lowConfidence: false, tradable: true,
 });
 
+// A REAL index path, from Yahoo's one-minute NIFTY bars.
+//
+// ---------------------------------------------------------------------------
+// What is real here, and what is not
+// ---------------------------------------------------------------------------
+//
+// REAL: every minute's open, high, low and close. That is the actual index,
+// from an actual session, and it is what the 3-candle trend, the EMA filter and
+// the midpoint rules will overwhelmingly be reading — a 21-candle EMA at 5s
+// spans under two minutes, so minute-scale structure dominates it.
+//
+// CONSTRUCTED: the path WITHIN each minute. Yahoo's finest interval is 1m and
+// nothing available on this account records the index at 5s resolution
+// (`candles` has 5s rows, but the recent ones carry the 25117.55 stale feed).
+// So each real minute is expanded into twelve 5s bars that start at its open,
+// end at its close, and touch its high and its low — the anchors are real, the
+// wiggle between them is not.
+//
+// The OPTION CHAIN is still modelled off the spot by the same textbook curve the
+// random-walk mode uses. Yahoo carries no NSE option data at all. So this tests
+// the DECISION path against real index movement; it does not test the fills.
+//
+// Deterministic: the same date and start replay identically.
+async function buildHistoryPath(path, bars, t0, rnd) {
+  const { service } = require('../src/market/yahoo');
+  const day = HISTORY;
+  const next = new Date(Date.parse(day + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10);
+
+  const res = await service.getHistoricalData('NIFTY', '1m', day, next);
+  const ist = (t) => new Date(t + 19800000).toISOString().slice(11, 16);
+  const all = (res.bars || []).filter(b => b.close != null);
+  if (!all.length) throw new Error(`Yahoo returned no 1-minute bars for ${day}`);
+
+  const from = all.filter(b => ist(b.time) >= START);
+  const minutes = from.slice(0, Math.ceil(bars / 12));
+  if (minutes.length < Math.ceil(bars / 12)) {
+    console.log(`  NOTE: only ${minutes.length} minutes available from ${START} on ${day}`);
+  }
+
+  console.log(`  REAL index path: ${day} from ${START}, ${minutes.length} one-minute bars`);
+  console.log('  minute open/high/low/close are REAL; the path inside each minute is constructed;');
+  console.log('  the option chain is modelled off the spot (Yahoo has no NSE option data).');
+  console.log('');
+
+  let seq = 0;
+  let prevClose = Math.round(minutes[0].open * 100);
+  for (const m of minutes) {
+    const o = Math.round(m.open * 100);
+    const h = Math.round(m.high * 100);
+    const l = Math.round(m.low * 100);
+    const c = Math.round(m.close * 100);
+
+    // ONE CONTINUOUS WALK across the minute, then chunked into 12 bars of 5
+    // samples — not 12 independent bars each sitting at its own midpoint.
+    //
+    // The first version did the latter, and it produced a path with almost no
+    // movement INSIDE a bar: five samples at the same interpolated level plus a
+    // few paise of jitter. Nothing could ever fill, because a SELL limit at
+    // `close + 0.10` needs the premium to travel ten paise within about three
+    // samples, and a spot that only wobbles ±0.5 points moves the premium by a
+    // fraction of one. The replay reported 25 entries and 0 fills, which read as
+    // a broken strategy and was a broken fixture.
+    //
+    // The anchors are placed so the minute's real extremes are both visited: an
+    // up-minute dips to its low first and then makes its high, a down-minute the
+    // reverse. That is the ordinary shape, and it keeps the extremes off the
+    // close where they would fabricate a spike.
+    const up = c >= o;
+    const anchors = up ? [o, l, h, c] : [o, h, l, c];
+    const N = 60;                              // 12 bars x 5 samples
+    const walk = [];
+    for (let x = 0; x < N; x += 1) {
+      const t = x / (N - 1);                   // 0..1 across the minute
+      const seg = Math.min(2, Math.floor(t * 3));
+      const inSeg = (t * 3) - seg;
+      const a = anchors[seg];
+      const b = anchors[seg + 1];
+      // Jitter scaled to the minute's own range, so a quiet minute stays quiet
+      // and a violent one is not smoothed flat.
+      const noise = (rnd() - 0.5) * 2 * Math.max(5, Math.abs(h - l) / 8);
+      walk.push(Math.max(1, Math.round(a + (b - a) * inSeg + noise)));
+    }
+
+    for (let k = 0; k < 12 && seq < bars; k += 1, seq += 1) {
+      const samples = walk.slice(k * 5, k * 5 + 5);
+      const barOpen = prevClose;
+      const barClose = samples[samples.length - 1];
+      const ts = t0 + seq * STEP_MS;
+      path.push({
+        ts, samples,
+        bar: bar('SIM-NIFTY', barOpen, Math.max(barOpen, ...samples),
+          Math.min(barOpen, ...samples), barClose, ts),
+      });
+      prevClose = barClose;
+    }
+  }
+}
+
 async function main() {
   const bars = Math.round((MINUTES * 60) / 5);
   console.log(`\nOption Selling Engine — replay\n`);
@@ -123,6 +261,7 @@ async function main() {
   if (!await db.healthCheck()) throw new Error('the database is not reachable');
 
   const cfg = await settingsService.load();
+  LOT = (await settingsService.lotSizeFor(cfg.index)) || LOT;
   console.log(`  band ₹${(cfg._gate.premiumMinP / 100).toFixed(0)}–`
     + `${(cfg._gate.premiumMaxP / 100).toFixed(0)} · ${cfg.lots} lot(s) · `
     + `target ${cfg.initialTargetPoints} · stop ${cfg.initialStopPoints} · `
@@ -196,7 +335,9 @@ async function main() {
   // working. Feeding one tick per bar instead gives every entry a single chance
   // to fill and reports an engine that never trades.
   const path = [];
-  {
+  if (HISTORY) {
+    await buildHistoryPath(path, bars, t0, rnd);
+  } else {
     let spot = SPOT0;
     let prevClose = spot;
     for (let i = 0; i < bars; i += 1) {
@@ -254,6 +395,30 @@ async function main() {
       // gets its chance to fill, and where §12.4's timeout runs out if it does
       // not. One second of simulated time per sample.
       const next = path[i + 1];
+      // Feed one tick exactly AT the working limit, so it fills at the price it
+      // asked for. Uses the real broker path — nothing is patched.
+      if ((FILL_ALL || FILL_MARKET) && engine.trade && engine._entryDeadline
+          && engine.trade.requestedPriceP) {
+        const tok = String(engine.trade.token);
+        let at = engine.trade.requestedPriceP;                    // --fill-all
+        if (FILL_MARKET && next) {
+          // The premium at the NEXT sample — what a market order would get.
+          const m = /^(\d+)(CE|PE)$/.exec(tok);
+          if (m) at = premiumP(Number(m[1]), m[2], next.samples[0]);
+          // A SELL fills only at or above its limit, so to model a market order
+          // the resting limit is moved down to the prevailing price. Nothing
+          // else is patched — the fill, the reconciler and the engine's own
+          // accounting all run as they normally would.
+          for (const row of paper.orders.values()) {
+            if (row.status === 'WORKING' && String(row.token) === tok && row.side === 'SELL') {
+              row.limitPaise = Math.min(row.limitPaise, at);
+            }
+          }
+        }
+        paper.onTick(tok, at);
+        await reconciler.runOnce();
+        await engine._pollEntryFill();
+      }
       if (next) {
         for (const sampleSpot of next.samples) {
           for (const tok of [engine.candidate?.token, engine.trade?.token].filter(Boolean)) {
@@ -290,8 +455,12 @@ async function main() {
     const gross = closed.reduce((a, t) => a + Number(t.gross_pnl_p || 0), 0);
     const charges = closed.reduce((a, t) => a + Number(t.charges_p || 0), 0);
 
-    console.log('  index      ', (SPOT0 / 100).toFixed(2), '->', (spotP / 100).toFixed(2),
-      `(${((spotP - SPOT0) / 100).toFixed(2)} pts)`);
+    // The START is the first bar's OPEN, not SPOT0. In history mode the path
+    // begins wherever the real session did, and printing the synthetic constant
+    // as the open reported a move the replay never made.
+    const startP = path.length ? path[0].bar.openP : SPOT0;
+    console.log('  index      ', (startP / 100).toFixed(2), '->', (spotP / 100).toFixed(2),
+      `(${((spotP - startP) / 100).toFixed(2)} pts)`);
     console.log('  cycles     ', bars);
     console.log('  entries    ', trades.length, '| filled & closed', closed.length,
       '| never filled', errored.length, '| left open', stillOpen.length);
@@ -339,8 +508,17 @@ async function main() {
       }
     }
 
-    console.log('\n  This is a random walk priced off a textbook curve. It shows how the RULES');
-    console.log('  behave, not what the market will do.\n');
+    console.log('');
+    if (HISTORY) {
+      console.log(`  The INDEX PATH is real — ${HISTORY} from ${START}: every minute's open,`);
+      console.log('  high, low and close came from the exchange. The path INSIDE each minute is');
+      console.log('  constructed, and the OPTION CHAIN is modelled off the spot — Yahoo carries no');
+      console.log('  NSE option data, so no fill here reflects a real book.');
+      console.log('  This tests the DECISIONS against real movement. It does not test executions.');
+    } else {
+      console.log('  This is a random walk priced off a textbook curve. It shows how the RULES');
+      console.log('  behave, not what the market will do.');
+    }
   } finally {
     Object.assign(risk, savedRisk);
 

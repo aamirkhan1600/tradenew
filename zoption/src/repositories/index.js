@@ -109,6 +109,26 @@ const instruments = {
   },
 
   // The full ladder for one expiry, both option types, ordered by strike.
+
+  // The contract size the exchange is actually using, from the master.
+  //
+  // NIFTY moved from 75 to 65, and every economic figure on the settings page
+  // and in preflight was computed against a hardcoded 75 — so an operator read a
+  // break-even built on 15% more quantity than the engine would ever send. The
+  // ENGINE was always right (it sizes from `quote.lotSize`); it was the numbers
+  // a human reads that were wrong, which is the worse way round.
+  //
+  // Taken from the nearest expiry: a lot-size change is announced per series, so
+  // the front contract is the one that governs what would trade today.
+  async lotSize(underlying = 'NIFTY') {
+    const row = await db.queryOne(
+      `SELECT lot_size FROM instruments
+        WHERE underlying = ? AND option_type IN ('CE','PE') AND lot_size > 0
+          AND expiry_date >= CURDATE()
+        ORDER BY expiry_date ASC LIMIT 1`, [underlying]);
+    return row?.lot_size ? Number(row.lot_size) : null;
+  },
+
   async chain(underlying, expiryDate) {
     return db.query(
       `SELECT token, segment, symbol, strike, option_type, lot_size, tick_size

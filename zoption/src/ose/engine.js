@@ -943,7 +943,7 @@ class OseEngine {
 
     const tradeUid = cryptoRandomId();
     const stopP = ladder.initialStop(priceP, this.cfg.initialStopPoints);
-    const targetP = ladder.targetPriceFor(priceP, 1);
+    const targetP = ladder.targetPriceFor(priceP, 1, this.cfg._rungP);
 
     // §19.2 write #1 — SYNCHRONOUS, and BEFORE the order. If this fails no order
     // is placed, which is what guarantees no position can exist without a
@@ -1347,7 +1347,7 @@ class OseEngine {
     // §12.4 — every target and stop derives from the FILL, never the request.
     this.trade.stopPriceP = ladder.initialStop(this.trade.entryPriceP, this.cfg.initialStopPoints);
     this.trade.targetLevel = 1;
-    this.trade.targetPriceP = ladder.targetPriceFor(this.trade.entryPriceP, 1);
+    this.trade.targetPriceP = ladder.targetPriceFor(this.trade.entryPriceP, 1, this.cfg._rungP);
 
     this.orders.checkSlippage(this.trade);
     this.machine.attempt(EVENTS.ORDER_FILLED, { tradeId: this.trade.tradeId });
@@ -2031,7 +2031,7 @@ function settingsFingerprint(cfg) {
     cfg._gate.premiumMinP, cfg._gate.premiumMaxP, cfg._entryOffsetP,
     cfg._rules.targetExtensionPoints, cfg._rules.premiumSafetyExitPoints,
     cfg._rules.trailingStopEnabled, cfg._rules.stopGuardEnabled,
-    cfg.initialTargetPoints, cfg.initialStopPoints,
+    cfg.initialTargetPoints, cfg.initialStopPoints, cfg._rungP,
     cfg._risk.maxTradesPerDay, cfg._risk.maxConsecutiveLosses, cfg._risk.tradeOnExpiryDay,
     // newdoc/ema.md. Every one of these changes which candles are tradable, so
     // leaving them out would let an operator retune the EMA filter and have the

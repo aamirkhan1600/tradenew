@@ -144,7 +144,7 @@ router.get('/ose/settings', auth.requirePage, wrap(async (req, res) => {
   // still render a value rather than a blank input that saves as invalid.
   const settings = settingsService.withDefaults(await repo.settings.get(settingsService.PROFILE));
   const { warnings } = settingsService.validate(settings);
-  const note = settingsService.breakevenNote(settings, 75);
+  const note = settingsService.breakevenNote(settings, await settingsService.lotSizeFor(settings.index));
   res.render('oseSettings', {
     page: 'ose',
     settings,
@@ -158,13 +158,20 @@ router.get('/ose/settings', auth.requirePage, wrap(async (req, res) => {
 }));
 
 router.post('/ose/settings', auth.requirePage, wrap(async (req, res) => {
+  // The contract size the exchange is actually using — resolved ONCE, and used
+  // for both the validation warnings and the break-even panel. Hardcoding 75
+  // here meant every figure on this page was computed on 15% more quantity than
+  // the engine would ever send.
+  const lotSize = await settingsService.lotSizeFor(
+    settingsService.withDefaults(req.body).index);
+
   const render = (extra) => {
     const settings = settingsService.withDefaults({ ...req.body, ...coerce(req.body) });
     return res.render('oseSettings', {
       page: 'ose',
       settings,
-      warnings: settingsService.validate(settings).warnings,
-      note: settingsService.breakevenNote(settings, 75),
+      warnings: settingsService.validate(settings, { lotSize }).warnings,
+      note: settingsService.breakevenNote(settings, lotSize),
       mustConfirm: C.MUST_CONFIRM,
       unsigned: settingsService.unsignedItems(settings).map(m => m.id),
       saved: null,
@@ -181,7 +188,7 @@ router.post('/ose/settings', auth.requirePage, wrap(async (req, res) => {
       page: 'ose',
       settings,
       warnings,
-      note: settingsService.breakevenNote(settings, 75),
+      note: settingsService.breakevenNote(settings, lotSize),
       mustConfirm: C.MUST_CONFIRM,
       unsigned: settingsService.unsignedItems(settings).map(m => m.id),
       // The engine reads settings at cycle start and never mid-cycle, so a save

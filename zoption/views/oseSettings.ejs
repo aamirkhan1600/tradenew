@@ -68,8 +68,8 @@
 
     <h2>Target and stop <small>§14, §15 — premium points, never index points</small></h2>
     <div class="grid">
-      <label>Initial target (points)
-        <input name="initialTargetPoints" type="number" step="1" min="1" value="<%= settings.initialTargetPoints %>">
+      <label>Initial target (points) <span class="hint">one rung of the ladder</span>
+        <input name="initialTargetPoints" type="number" step="0.05" min="0.05" value="<%= settings.initialTargetPoints %>">
       </label>
       <label>Initial stop (points)
         <input name="initialStopPoints" type="number" step="1" min="1" value="<%= settings.initialStopPoints %>">
