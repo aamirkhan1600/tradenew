@@ -163,3 +163,73 @@ test('a zero or negative price is not a price', () => {
   b.addTick('T', -5, ist('2026-07-28 10:15:20'));
   assert.equal(b.inProgress('T'), null);
 });
+
+/* ============== a feed gap must not become a HALT ========================== */
+
+// On 2026-08-02 the engine halted with REPEATED_CYCLE_OVERRUNS after a
+// thirteen-minute silence in the index feed. The cause was here, not there: the
+// gap fill was unbounded, so ONE tick emitted ~157 bars synchronously. The first
+// started an async decision cycle and set `_cycleBusy`; the other 156 landed on
+// the engine's §4.2 overrun branch inside the same millisecond, and three
+// overruns in a rolling minute is a halt.
+//
+// §7.5 already said this file caps it — "one silent bucket is synthesised; two
+// or more is a FEED GAP and is never synthesised" — the code just did not.
+test('a long silence emits a BOUNDED number of bars, not one per missing bucket', () => {
+  const b = new CandleBuilder({ timeframe: '5s', minTicks: 3, clockMs: 100000 });
+  b.track('X');
+  const out = [];
+  b.on('candle', (c) => out.push(c));
+
+  const t0 = Date.UTC(2026, 7, 2, 10, 0, 0);
+  b.addTick('X', 2438360, t0);
+  b.addTick('X', 2438400, t0 + 13 * 60 * 1000);      // thirteen minutes later
+  b.stop();
+
+  assert.ok(out.length <= 4,
+    `a 13-minute gap emitted ${out.length} bars — unbounded again, and that is a HALT`);
+  // The engine's feed-gap exit counts CONSECUTIVE synthetic bars and fires above
+  // MAX_SYNTHETIC_RUN (1), so the cap must still let it see more than one.
+  assert.ok(out.filter(c => c.synthetic).length >= 2,
+    'the gap must remain visible to the priority-0 feed-gap exit');
+});
+
+test('the same cap applies on the TIMER path — a slept process is a jumped clock', () => {
+  const b = new CandleBuilder({ timeframe: '5s', minTicks: 3, clockMs: 100000 });
+  b.track('X');
+  const out = [];
+  b.on('candle', (c) => out.push(c));
+
+  const t0 = Date.UTC(2026, 7, 2, 10, 0, 0);
+  b.addTick('X', 2438360, t0);
+  // The sweep normally runs every 250ms. This is what it sees after the machine
+  // was asleep for twenty minutes.
+  b._sweep(t0 + 20 * 60 * 1000);
+  b.stop();
+
+  assert.ok(out.length <= 4,
+    `one sweep after a 20-minute suspend emitted ${out.length} bars`);
+});
+
+test('a bounded gap is still filled exactly — the cap must not break the normal case', () => {
+  const b = new CandleBuilder({ timeframe: '5s', minTicks: 3, clockMs: 100000 });
+  b.track('X');
+  const out = [];
+  b.on('candle', (c) => out.push(c));
+
+  const t0 = Date.UTC(2026, 7, 2, 10, 0, 0);
+  // Two ticks first, so the PARTIAL opening bar is closed and discarded before
+  // the gap is created — the first bucket describes the subscription, not the
+  // market, and this file never emits it.
+  b.addTick('X', 2438360, t0);
+  b.addTick('X', 2438370, t0 + 5000);
+  out.length = 0;
+
+  b.addTick('X', 2438400, t0 + 15000);        // exactly one silent bucket
+  b.stop();
+
+  assert.equal(out.length, 2, 'the closed bar plus one synthetic');
+  assert.equal(out[0].synthetic, false, 'the real bar that just closed');
+  assert.equal(out[1].synthetic, true, 'and the one silent bucket, filled');
+  assert.equal(out[1].bucketStart, t0 + 10000, 'in the right bucket');
+});

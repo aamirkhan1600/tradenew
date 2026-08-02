@@ -229,7 +229,7 @@ async function main() {
     let spotRow = null;
     try {
       spotRow = await db.queryOne(
-        `SELECT nifty_close_p FROM ose_decisions WHERE trade_date = ?
+        `SELECT nifty_close_p, index_source FROM ose_decisions WHERE trade_date = ?
            ORDER BY id DESC LIMIT 1`, [time.tradeDate()]);
     } catch (err) {
       fail('engine spot readable', `the decision log could not be read — ${err.message}`);
@@ -266,8 +266,23 @@ async function main() {
         // THE check that would have caught 2026-08-02, run here because this is
         // the first moment both halves exist: a spot the engine is deciding on
         // and a chain to cross-examine it with.
+        // WHICH spot is being checked matters more than the number.
+        //
+        // When the engine is running on the derived index, the "feed" here IS
+        // the chain, so the comparison is against itself and passes by
+        // construction — 0.00 points apart, every time. Reported as a PASS with
+        // no qualification, that reads as "the broker feed is healthy" on a
+        // morning when it is 734 points wrong and the engine has quietly routed
+        // around it. The check is not wrong; presenting it without its source
+        // would be.
+        const derivedIndex = String(spotRow?.index_source || '') === 'CHAIN';
         const sc = spotGuard.check(spotP, snap.quotes, cfg._spotCheck);
-        if (sc.verdict === spotGuard.VERDICT.DIVERGED) {
+        if (derivedIndex) {
+          warn('index feed agrees with the chain',
+            'NOT CHECKED — the engine is running on the DERIVED index, so this would be '
+            + 'comparing the chain against itself. The quoted feed is what to look at: run '
+            + '`node scripts/diagnose-spot.js`, which cross-examines it directly.');
+        } else if (sc.verdict === spotGuard.VERDICT.DIVERGED) {
           fail('index feed agrees with the chain',
             `feed ${money.formatPrice(sc.feedSpotP)} vs ${sc.pairs} strikes pricing it at `
             + `${money.formatPrice(sc.impliedSpotP)} — out by `

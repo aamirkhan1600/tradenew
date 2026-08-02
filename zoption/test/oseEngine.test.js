@@ -642,6 +642,29 @@ test('a source switch CLEARS the candle buffer — a 734-point step is not a mar
     });
   });
 
+test('AUTO still derives when the SPOT CHECK is disabled — the two are independent',
+  async () => {
+    // `spotCheckEnabled` governs whether a divergence blocks ENTRIES. Whether the
+    // index is derived from the chain is a different question. Tying them
+    // together made AUTO silently inert: with the check off, `check()` returns
+    // SPOT_CHECK_DISABLED, neither branch matched, and the engine sat on a
+    // 734-point-wrong feed while the settings page still said AUTO.
+    await withRepo(async () => {
+      const e = engine();
+      e.cfg = settingsService.derive(settingsService.withDefaults({
+        mode: 'PAPER', spotCheckEnabled: false, syntheticIndexMode: 'AUTO',
+      }));
+      assert.equal(e.cfg._spotCheck.enabled, false, 'the fixture must actually have it off');
+
+      withChain(e, 2438360);
+      e._feedSample = { ltpPaise: 2511755, ts: Date.now() };
+      await e._maintainIndexSource();
+
+      assert.equal(e.indexSource, 'CHAIN',
+        'a disabled spot CHECK must not disable the synthetic SOURCE');
+    });
+  });
+
 test('OFF never leaves the feed, and FORCE never uses it', async () => {
   await withRepo(async () => {
     const off = engine();

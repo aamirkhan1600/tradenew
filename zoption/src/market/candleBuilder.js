@@ -30,6 +30,13 @@
 const EventEmitter = require('events');
 const time = require('../core/time');
 
+// How many silent buckets one tick may synthesise before the rest of the gap is
+// simply skipped. Two, because the engine's feed-gap exit needs to SEE more than
+// MAX_SYNTHETIC_RUN (1) consecutive synthetic bars to fire — and one bar per
+// missing second past that is what turned a feed gap into a HALT. See the note
+// in `addTick`.
+const MAX_SYNTHETIC_FILL = 2;
+
 class CandleSeries {
   constructor({ token, timeframe }) {
     this.token = String(token);
@@ -42,6 +49,8 @@ class CandleSeries {
     // The first bucket we touch is partial by construction — we joined it
     // mid-flight. Emitted with `partial: true` and never traded on.
     this.sawFirst = false;
+    // Buckets dropped because the gap exceeded MAX_SYNTHETIC_FILL — see addTick.
+    this.gapsSkipped = 0;
   }
 
   _open(bucketStartMs, pricePaise) {
@@ -100,9 +109,36 @@ class CandleSeries {
     // first rollover.
     const previous = this._close();
     closed.push(previous);
-    for (let b = previous.bucketStart + this.seconds * 1000; b < bucket; b += this.seconds * 1000) {
-      closed.push(this._synthetic(b));
+
+    // THE GAP FILL IS CAPPED, and the cap is not a tidiness measure.
+    //
+    // Unbounded, one tick arriving after a long silence emits one bar per missing
+    // bucket — SYNCHRONOUSLY, in a single call. Every one of them fires a
+    // `candle` event, the first starts an async decision cycle and sets
+    // `_cycleBusy`, and every remaining bar lands on the engine's §4.2 overrun
+    // branch in the same millisecond. Three overruns in a rolling minute is a
+    // HALT, so a thirteen-minute feed gap halted the engine 151 times over in
+    // about five milliseconds. Observed on 2026-08-02 at 19:42:44.
+    //
+    // The cap is what §7.5 already says this file does: "one silent bucket is
+    // synthesised so the one-candle-one-cycle invariant survives; two or more is
+    // a FEED GAP and is never synthesised". Two bars is enough for the ENGINE to
+    // see it — `indexGap` counts consecutive synthetic bars and the priority-0
+    // feed-gap exit fires above MAX_SYNTHETIC_RUN — so emitting a bar per missing
+    // second past that adds nothing but the storm.
+    const step = this.seconds * 1000;
+    const missing = Math.max(0, Math.round((bucket - previous.bucketStart) / step) - 1);
+    const fill = Math.min(missing, MAX_SYNTHETIC_FILL);
+    for (let i = 0; i < fill; i += 1) {
+      closed.push(this._synthetic(previous.bucketStart + (i + 1) * step));
     }
+    if (missing > fill) {
+      // Recorded on the bar that OPENS after the gap, so a reader of the series
+      // can tell "the feed stopped for eleven minutes" from "the market was
+      // quiet". Without it the series would simply skip, and a skip is invisible.
+      this.gapsSkipped += missing - fill;
+    }
+
     this.current = this._open(bucket, price);
     return closed;
   }
@@ -139,11 +175,21 @@ class CandleSeries {
     if (nowMs < this.current.bucketEnd) return [];
 
     const closed = [this._close()];
-    // Fill the silence up to (but not including) the bucket now in progress.
+
+    // Capped for the same reason as `addTick` — and this is the path more likely
+    // to hit it. The sweep runs every 250ms, so the gap is normally one bucket;
+    // but `nowMs` jumps whenever the PROCESS was not running, and a laptop that
+    // slept, a blocked event loop or a long stop-the-world pause all produce one
+    // sweep that would otherwise emit a bar per missing second, synchronously,
+    // straight into the engine's overrun guard.
+    const step = this.seconds * 1000;
     const nowBucket = time.bucketStart(nowMs, this.seconds);
-    for (let b = closed[0].bucketStart + this.seconds * 1000; b < nowBucket; b += this.seconds * 1000) {
-      closed.push(this._synthetic(b));
+    const missing = Math.max(0, Math.round((nowBucket - closed[0].bucketStart) / step) - 1);
+    const fill = Math.min(missing, MAX_SYNTHETIC_FILL);
+    for (let i = 0; i < fill; i += 1) {
+      closed.push(this._synthetic(closed[0].bucketStart + (i + 1) * step));
     }
+    if (missing > fill) this.gapsSkipped += missing - fill;
     return closed;
   }
 }

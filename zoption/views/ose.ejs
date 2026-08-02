@@ -173,7 +173,7 @@
     </section>
 
     <section class="card">
-      <h2>Trade list <small>most recent first</small></h2>
+      <h2>Trade list <small id="trades-count">most recent first</small></h2>
       <div class="tablewrap">
         <table class="events" id="trades-table">
           <thead>
@@ -183,6 +183,9 @@
           <tbody><tr><td colspan="6" class="muted">no trades yet</td></tr></tbody>
         </table>
       </div>
+      <!-- Ten rows by default. The table refreshes every ten seconds, so the
+           expansion has to survive a refresh — see `tradesShown`. -->
+      <p class="hint" id="trades-more"></p>
     </section>
 
   </div>
@@ -518,14 +521,76 @@ async function refreshDecisions() {
   }).join('');
 }
 
+// How many rows the trade list is showing, and the last set fetched.
+//
+// MODULE SCOPE, deliberately. The list re-fetches every ten seconds, and if the
+// count lived inside the render the table would snap back to ten rows under
+// whoever had just expanded it — which is worse than not having the button.
+const TRADES_PAGE = 10;
+let tradesShown = TRADES_PAGE;
+let tradesCache = [];
+let tradesCapped = false;        // the fetch itself hit its limit, so there may be more
+
 async function refreshTrades() {
-  const r = await (await fetch('/api/ose/trades?limit=40')).json();
+  // Ask for a page beyond what is displayed, so "Show more" can reveal instantly
+  // rather than waiting on a round trip.
+  const want = Math.min(200, Math.max(50, tradesShown + TRADES_PAGE * 2));
+  const r = await (await fetch('/api/ose/trades?limit=' + want)).json();
+  if (!r.ok) return;
+  tradesCache = r.trades || [];
+  tradesCapped = tradesCache.length >= want;
+  renderTrades();
+}
+
+function showMoreTrades() {
+  tradesShown += TRADES_PAGE;
+  renderTrades();
+  // Only go back to the server when the cache is exhausted AND there might be
+  // more behind it.
+  if (tradesShown > tradesCache.length && tradesCapped) refreshTrades().catch(() => {});
+}
+
+function showFewerTrades() {
+  tradesShown = TRADES_PAGE;
+  renderTrades();
+  el('trades-table').scrollIntoView({ block: 'nearest' });
+}
+
+function renderTrades() {
   const body = document.querySelector('#trades-table tbody');
-  if (!r.ok || !r.trades.length) {
-    body.innerHTML = '<tr><td colspan="10" class="muted">no trades yet</td></tr>';
+  const more = el('trades-more');
+  const count = el('trades-count');
+
+  if (!tradesCache.length) {
+    body.innerHTML = '<tr><td colspan="6" class="muted">no trades yet</td></tr>';
+    more.innerHTML = '';
+    count.textContent = 'most recent first';
     return;
   }
-  body.innerHTML = r.trades.map(t => {
+
+  const rows = tradesCache.slice(0, tradesShown);
+  count.textContent = 'most recent first · showing ' + rows.length
+    + ' of ' + tradesCache.length + (tradesCapped ? '+' : '');
+
+  const hasMore = tradesCache.length > rows.length || tradesCapped;
+  const parts = [];
+  if (hasMore) {
+    // No count on the label when the fetch was capped — we do not know how many
+    // are behind it, and a number that is quietly wrong is worse than none.
+    const behind = tradesCache.length - rows.length;
+    parts.push('<button type="button" class="seg ghost" id="trades-more-btn">Show '
+      + TRADES_PAGE + ' more' + (!tradesCapped && behind ? ' (' + behind + ' left)' : '') + '</button>');
+  }
+  if (rows.length > TRADES_PAGE) {
+    parts.push('<button type="button" class="seg ghost" id="trades-fewer-btn">Show fewer</button>');
+  }
+  more.innerHTML = parts.join(' ');
+  const moreBtn = el('trades-more-btn');
+  if (moreBtn) moreBtn.onclick = showMoreTrades;
+  const fewerBtn = el('trades-fewer-btn');
+  if (fewerBtn) fewerBtn.onclick = showFewerTrades;
+
+  body.innerHTML = rows.map(t => {
     // §9.2.1 — say when a strike was chosen without the liquidity filters.
     const skipped = t.select && t.select.skipped && t.select.skipped.length
       ? ' <small class="down">no ' + esc(t.select.skipped.join('/')) + '</small>' : '';

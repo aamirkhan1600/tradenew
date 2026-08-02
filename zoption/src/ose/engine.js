@@ -640,7 +640,18 @@ class OseEngine {
     const feedP = this._feedSample?.ltpPaise ?? null;
     if (implied == null || feedP == null) return;      // no opinion, change nothing
 
-    const check = spotGuard.check(feedP, snap.quotes, this.cfg._spotCheck);
+    // `enabled: true`, FORCED — and this is not a convenience.
+    //
+    // `spotCheckEnabled` governs whether a divergence BLOCKS ENTRIES. Whether
+    // the index is derived from the chain is a different question, and tying the
+    // two together made AUTO silently inert: with the check off, `check()`
+    // returns SPOT_CHECK_DISABLED, neither branch below matched, and the engine
+    // sat on a 734-point-wrong feed indefinitely while the settings page still
+    // said AUTO. Two settings entangled with nothing saying so.
+    //
+    // The band and the pair count are still the operator's — only the on/off is
+    // overridden, because here it means something else.
+    const check = spotGuard.check(feedP, snap.quotes, { ...this.cfg._spotCheck, enabled: true });
     if (check.verdict === spotGuard.VERDICT.DIVERGED) {
       this._switchIndexSource('CHAIN',
         `the quoted index ${money.formatPrice(feedP)} disagrees with the chain's `
