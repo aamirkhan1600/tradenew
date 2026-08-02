@@ -231,10 +231,87 @@ function extremes(rows) {
 // the UI which of these numbers came from the broker and which could not be
 // computed, so a missing feed shows an em-dash instead of a zero that reads as
 // "no open interest today".
+// What an `ltp`-only account CAN say.
+//
+// Open interest, volume, PCR, max pain and the VIX all need fields this
+// entitlement does not send, and on a Kotak retail account every one of them is
+// null forever. A panel that is mostly em-dashes trains an operator to stop
+// reading it, so these are computed alongside them from the two things that ARE
+// always present: the premiums themselves, and the spot.
+//
+// Every one is derived from the AT-THE-MONEY pair, which is the most liquid and
+// most recently traded part of the chain — the same reason `spotGuard` takes its
+// median there.
+function atmMetrics(rows, spot, expiry) {
+  const sp = num(spot);
+  const atm = sp === null ? null : atmStrike(rows, sp);
+  const row = atm === null ? null : rows.find(r => num(r.strike) === atm);
+
+  const ceP = num(row?.call?.ltp);
+  const peP = num(row?.put?.ltp);
+
+  // The straddle IS the market's own price for movement between now and expiry:
+  // buying both legs breaks even only if the index travels further than their
+  // combined cost. It is the single most informative number available here.
+  const straddle = (ceP === null || peP === null) ? null : ceP + peP;
+
+  const ceIv = num(row?.call?.iv);
+  const peIv = num(row?.put?.iv);
+  const atmIv = (ceIv === null && peIv === null) ? null
+    : (ceIv === null ? peIv : (peIv === null ? ceIv : (ceIv + peIv) / 2));
+
+  // Skew: the put's implied volatility above the call's, two strikes either side
+  // of the money. Positive is the usual state — downside insurance costs more —
+  // and a flattening or inverted skew is a real signal that costs nothing here.
+  let skew = null;
+  if (atm !== null) {
+    const step = strikeStepOf(rows) || 50;
+    const up = rows.find(r => num(r.strike) === atm + 2 * step);
+    const down = rows.find(r => num(r.strike) === atm - 2 * step);
+    const otmPut = num(down?.put?.iv);
+    const otmCall = num(up?.call?.iv);
+    if (otmPut !== null && otmCall !== null) skew = otmPut - otmCall;
+  }
+
+  let daysToExpiry = null;
+  if (expiry) {
+    const ms = Date.parse(String(expiry).slice(0, 10) + 'T15:30:00+05:30') - Date.now();
+    if (Number.isFinite(ms)) daysToExpiry = Math.max(0, ms / 86400000);
+  }
+
+  return {
+    atmStrike: atm,
+    atmCall: ceP,
+    atmPut: peP,
+    atmStraddle: straddle,
+    // As a fraction of spot, which is how a move is actually judged.
+    expectedMovePct: (straddle === null || sp === null || sp === 0) ? null : straddle / sp,
+    expectedMoveLow: (straddle === null || sp === null) ? null : sp - straddle,
+    expectedMoveHigh: (straddle === null || sp === null) ? null : sp + straddle,
+    atmIv,
+    ivSkew: skew,
+    daysToExpiry,
+  };
+}
+
+// The gap between adjacent strikes, taken as the smallest positive difference so
+// one missing strike in the middle cannot double it.
+function strikeStepOf(rows) {
+  const strikes = [...new Set((rows || []).map(r => num(r.strike)).filter(s => s !== null))]
+    .sort((a, b) => a - b);
+  let step = null;
+  for (let i = 1; i < strikes.length; i += 1) {
+    const d = strikes[i] - strikes[i - 1];
+    if (d > 0 && (step === null || d < step)) step = d;
+  }
+  return step;
+}
+
 function chainSummary(rows, { spot = null, expiry = null, lotSize = null, vix = null } = {}) {
   const ratio = pcr(rows);
   const pain = maxPain(rows);
   const atm = spot == null ? null : atmStrike(rows, spot);
+  const derived = atmMetrics(rows, spot, expiry);
 
   return {
     spot,
@@ -242,6 +319,7 @@ function chainSummary(rows, { spot = null, expiry = null, lotSize = null, vix = 
     lotSize,
     vix,
     atmStrike: atm,
+    ...derived,
     pcr: ratio.oi,
     pcrVolume: ratio.volume,
     maxPain: pain ? pain.strike : null,
@@ -251,12 +329,20 @@ function chainSummary(rows, { spot = null, expiry = null, lotSize = null, vix = 
     totalCallVolume: ratio.callVol,
     totalPutVolume: ratio.putVol,
     extremes: extremes(rows),
+    // Which numbers are REAL. The UI hides a tile whose capability is false
+    // rather than rendering an em-dash: a panel of dashes is one an operator
+    // stops reading, and the point of this flag is to keep the panel worth
+    // reading on whatever entitlement is actually in force.
     available: {
       oi: ratio.callOi !== null || ratio.putOi !== null,
       volume: ratio.callVol !== null || ratio.putVol !== null,
       maxPain: pain !== null,
       pcr: ratio.oi !== null,
       vix: vix !== null,
+      straddle: derived.atmStraddle !== null,
+      expectedMove: derived.expectedMovePct !== null,
+      iv: derived.atmIv !== null,
+      skew: derived.ivSkew !== null,
     },
   };
 }
@@ -264,4 +350,5 @@ function chainSummary(rows, { spot = null, expiry = null, lotSize = null, vix = 
 module.exports = {
   BUILDUP_LABEL,
   maxPain, pcr, buildup, writingBias, moneyness, atmStrike, extremes, chainSummary,
+  atmMetrics, strikeStepOf,
 };

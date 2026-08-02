@@ -34,6 +34,7 @@ const { STATES } = require('../src/ose/machine');
 const { OrderRouter } = require('../src/execution/orderRouter');
 const { Reconciler } = require('../src/execution/reconciler');
 const { PaperBroker } = require('../src/broker/paperBroker');
+const C = require('../src/ose/constants');
 
 const KEEP = process.argv.includes('--keep');
 const CLEAN = process.argv.includes('--clean');
@@ -61,6 +62,27 @@ function bar(token, o, h, l, c, tsMs, over = {}) {
     openP: o, highP: h, lowP: l, closeP: c,
     tickCount: 5, synthetic: false, lowConfidence: false, tradable: true, ...over,
   };
+}
+
+// newdoc/ema.md — the EMA confirmation filter needs EMA_SLOW + 1 completed
+// candles before it will pass anything, so every scenario below has to hand the
+// engine a warm index series before it hands it an entry candle. Three rising
+// bars satisfied the 3-candle trend engine and now stop at EMA_WARMING_UP.
+//
+// Returns the close of the last bar written, so a scenario can carry the ramp
+// forward into its own entry candle rather than jumping to an unrelated level —
+// a discontinuity would show up as a crossover or as chop and refuse the entry
+// for a reason that has nothing to do with what is being tested.
+const EMA_WARMUP = C.EMA_SLOW + 1;
+
+function warmIndex(engine, token, t0, { from = 2450000, stepP = 300, bars: n = EMA_WARMUP + 3 } = {}) {
+  let close = from;
+  for (let i = 0; i < n; i += 1) {
+    close = from + i * stepP;
+    engine.indexSeries.push(
+      bar(token, close - stepP, close + 100, close - stepP - 100, close, t0 + i * 5000));
+  }
+  return { closeP: close, nextTs: t0 + n * 5000 };
 }
 
 function optionQuote(ltpP) {
@@ -91,6 +113,11 @@ async function main() {
       await db.query('DELETE FROM ose_trades WHERE id = ?', [r.id]).catch(() => {});
     }
     console.log(`  removed ${rows.length} self-test trade(s) and their orders\n`);
+    // The pool holds the event loop open, and `main()`'s caller only closes it
+    // on the normal path. Without this, `--clean` does its work and then HANGS
+    // until it is killed — which reads as a failed cleanup when the cleanup
+    // actually succeeded.
+    await db.close();
     return;
   }
 
@@ -115,6 +142,7 @@ async function main() {
 
   // LENIENT, because the account is `ltp`-only and STRICT would (correctly)
   // select nothing — that behaviour has its own test.
+  engine.decisionSource = 'SELFTEST';   // never confuse a self test with a session
   engine.cfg = settingsService.derive(settingsService.withDefaults({
     mode: 'PAPER', liquidityMode: 'LENIENT', lots: 1,
     premiumMin: 15, premiumMax: 25, initialTargetPoints: 1, initialStopPoints: 2,
@@ -151,13 +179,17 @@ async function main() {
   const statsBefore = await repo.oseStats.ensure(tradeDate);
 
   try {
-    /* --- 1. the trend, from three rising candles ------------------------- */
-    for (let i = 0; i < 3; i += 1) {
-      const c = 2450000 + i * 300;
-      engine.indexSeries.push(bar('NIFTY-SELFTEST', c - 300, c + 100, c - 400, c, t0 + i * 5000));
-    }
-    // A candle that closes above its own bullish midpoint -> SELL PE.
-    const entryCandle = bar('NIFTY-SELFTEST', 2451000, 2451400, 2450800, 2451350, t0 + 15000);
+    /* --- 1. the trend, from a rising ramp both filters can read ----------- */
+    //
+    // Long enough for newdoc/ema.md's EMA9/EMA20 as well as §10's three candles.
+    // A monotone ramp gives EMA9 above EMA20 with the close above both, no
+    // crossover inside the cooldown and no crossing of EMA9 to read as chop.
+    const warm = warmIndex(engine, 'NIFTY-SELFTEST', t0);
+
+    // A candle that continues the ramp AND closes above its own bullish
+    // midpoint -> SELL PE.
+    const entryCandle = bar('NIFTY-SELFTEST',
+      warm.closeP, warm.closeP + 500, warm.closeP - 100, warm.closeP + 450, warm.nextTs);
     engine.indexSeries.push(entryCandle);
 
     /* --- 2. first sight of the strike: tracked, not traded --------------- */
@@ -167,8 +199,10 @@ async function main() {
       engine.candidate ? SYMBOL : '(no candidate)');
 
     /* --- 3. with a sealed option bar, the entry is priced ---------------- */
-    engine.optionLast.set(TOKEN, bar(TOKEN, 2000, 2010, 1990, 2000, t0 + 15000));
-    const c2 = bar('NIFTY-SELFTEST', 2451000, 2451400, 2450800, 2451350, t0 + 20000);
+    engine.optionLast.set(TOKEN, bar(TOKEN, 2000, 2010, 1990, 2000, warm.nextTs));
+    const c2base = entryCandle.closeP;
+    const c2 = bar('NIFTY-SELFTEST',
+      c2base, c2base + 500, c2base - 100, c2base + 450, warm.nextTs + 5000);
     engine.indexSeries.push(c2);
     await engine._cycle(c2);
 
@@ -241,18 +275,18 @@ async function main() {
       e2.candidate = null;
       e2._cooldownLeft = 0;
 
-      const w0 = t0 + 60000;
+      const w0 = t0 + 300000;
       e2.indexSeries.length = 0;
-      for (let i = 0; i < 3; i += 1) {
-        const c = 2450000 + i * 300;
-        e2.indexSeries.push(bar('NIFTY-SELFTEST', c - 300, c + 100, c - 400, c, w0 + i * 5000));
-      }
-      const wc = bar('NIFTY-SELFTEST', 2451000, 2451400, 2450800, 2451350, w0 + 15000);
+      const w = warmIndex(e2, 'NIFTY-SELFTEST', w0);
+
+      const wc = bar('NIFTY-SELFTEST',
+        w.closeP, w.closeP + 500, w.closeP - 100, w.closeP + 450, w.nextTs);
       e2.indexSeries.push(wc);
-      e2.optionLast.set(TOKEN, bar(TOKEN, 2000, 2010, 1990, 2000, w0 + 15000));
+      e2.optionLast.set(TOKEN, bar(TOKEN, 2000, 2010, 1990, 2000, w.nextTs));
 
       await e2._cycle(wc);                             // tracks the candidate
-      const wc2 = bar('NIFTY-SELFTEST', 2451000, 2451400, 2450800, 2451350, w0 + 20000);
+      const wc2 = bar('NIFTY-SELFTEST',
+        wc.closeP, wc.closeP + 500, wc.closeP - 100, wc.closeP + 450, w.nextTs + 5000);
       e2.indexSeries.push(wc2);
       await e2._cycle(wc2);                            // takes the entry
 
@@ -275,15 +309,19 @@ async function main() {
         e2.optionLast.set(TOKEN, b);
         await e2._manageOnOptionCandle(b);
       };
-      await feed(1930, 1935, 1900, 1910, w0 + 25000);
-      await feed(1830, 1835, 1800, 1810, w0 + 30000);
+      await feed(1930, 1935, 1900, 1910, w.nextTs + 10000);
+      await feed(1830, 1835, 1800, 1810, w.nextTs + 15000);
       step(e2.trade?.targetLevel === 3, 'WIN: the ladder walked out twice',
         `rung ${e2.trade?.targetLevel}, target ${money.formatPrice(e2.trade?.targetPriceP)}`);
       step(e2.trade?.stopPriceP === 1910, 'WIN: the stop trailed to +1 point locked',
         money.formatPrice(e2.trade?.stopPriceP));
 
-      // The index turns against the thesis -> §13.3 closes it, in profit.
-      const turn = bar('NIFTY-SELFTEST', 2451400, 2451450, 2450000, 2450100, w0 + 35000);
+      // The index turns against the thesis -> §13.3 closes it, in profit. ONE
+      // candle down: enough to fail the position-validity filter against its own
+      // midpoints, and nowhere near enough to invert EMA9 against EMA20 — which
+      // is what keeps this scenario a test of §13.3 rather than of ema.md.
+      const turn = bar('NIFTY-SELFTEST',
+        wc2.closeP, wc2.closeP + 50, wc2.closeP - 1700, wc2.closeP - 1600, w.nextTs + 20000);
       e2.indexSeries.push(turn);
       await e2._cycle(turn);
       step(e2.machine.is(STATES.EXIT_PENDING), 'WIN: the position was closed',

@@ -24,6 +24,7 @@ const repo = require('../src/repositories');
 const neo = require('../src/broker/neoClient');
 const instrumentMaster = require('../src/market/instrumentMaster');
 const { CANDIDATE_FILTERS, isGatewayError } = require('../src/market/quoteSource');
+const spotGuard = require('../src/ose/spotGuard');
 
 const UNDERLYING = (process.argv[2] || 'NIFTY').toUpperCase();
 
@@ -128,9 +129,14 @@ async function main() {
   // the wrong axis.
   let anyPrice = false;
   let working = null;
+  // The PRICE that answered, kept so the cross-check below can ask whether it is
+  // actually right. `working` is the addressing that won, not the quote.
+  let workingLtp = null;
   for (const c of candidates) {
     const parsed = await tryQuote(c.label, c.q, CANDIDATE_FILTERS[0]);
-    if (parsed && parsed.ltp != null) { anyPrice = true; working = c; break; }
+    if (parsed && parsed.ltp != null) {
+      anyPrice = true; working = c; workingLtp = Number(parsed.ltp); break;
+    }
   }
   // Only once something answers is it worth asking what else it will send.
   if (working) {
@@ -153,6 +159,81 @@ async function main() {
       // so a sweep here would only spend quota re-proving it.
       await tryQuote(`${sample.symbol}`,
         { token: String(sample.token), segment: sample.segment }, CANDIDATE_FILTERS[0]);
+    }
+  }
+
+  /* ------------------------------------- is that price actually RIGHT? ----- */
+
+  // This script used to stop at "a price came back" and call it a success. On
+  // 2026-08-02 the price that came back was 25117.55 against a true 24383.60 and
+  // it printed "The gateway DOES quote the index" — which is how a 734-point
+  // error survived a diagnostic written to find exactly this class of problem.
+  //
+  // The chain is the second opinion: put-call parity gives an index level out of
+  // the option premiums this account CAN quote. See src/ose/spotGuard.js.
+  console.log('\nIS THAT PRICE RIGHT? — the chain\'s own opinion, by put-call parity');
+  const indexLtpP = Number.isFinite(workingLtp) ? Math.round(workingLtp * 100) : null;
+
+  if (!expiries.length) {
+    console.log('  no expiries in the master — nothing to cross-check against');
+  } else if (indexLtpP == null) {
+    console.log('  no index price came back, so there is nothing to cross-check');
+  } else {
+    try {
+      // ONE batched request, not a chain refresh.
+      //
+      // `ChainSnapshot.refresh()` fetches the whole ±20-strike window, and this
+      // script has already spent its share of the bucket pacing the requests
+      // above — an 82-strike batch on top of that comes back with ZERO rows from
+      // rate contention, which src/ose/snapshot.js documents as observed live.
+      // Eight strikes, both legs, in a single call is 1 request and plenty:
+      // parity is an IDENTITY, exact at every strike, so a handful near the
+      // feed's own idea of the money is all the second opinion needs.
+      const rows = await repo.instruments.chain(UNDERLYING, expiries[0]);
+      const atm = Math.round((indexLtpP / 100) / 50) * 50;
+      const wanted = new Set([-3, -2, -1, 0, 1, 2, 3, 4].map(i => atm + i * 50));
+      const legs = rows.filter(r => wanted.has(Number(r.strike)));
+
+      if (!legs.length) {
+        console.log(`  the master holds no strikes near ${(atm).toFixed(0)} for ${expiries[0]}`);
+      } else {
+        await sleep(PACE_MS);
+        const quoted = await session.quotes(
+          legs.map(r => ({ token: String(r.token), segment: r.segment })), CANDIDATE_FILTERS[0]);
+
+        const byToken = new Map();
+        for (const raw of quoted || []) {
+          const parsed = neo.readQuoteFull(raw);
+          for (const id of parsed.ids || []) byToken.set(String(id), parsed.ltp);
+        }
+        const quotes = legs.map(r => ({
+          strike: Number(r.strike),
+          optionType: r.option_type,
+          expiry: expiries[0],
+          ltpP: byToken.get(String(r.token)) == null
+            ? null : Math.round(Number(byToken.get(String(r.token))) * 100),
+          snapshotTs: Date.now(),
+        }));
+
+        const res = spotGuard.check(indexLtpP, quotes, {});
+        if (res.verdict === spotGuard.VERDICT.UNKNOWN) {
+          console.log(`  not measurable — ${res.reason}`);
+        } else if (res.verdict === spotGuard.VERDICT.DIVERGED) {
+          line('the index feed says', (res.feedSpotP / 100).toFixed(2));
+          line(`${res.pairs} option strikes say`, (res.impliedSpotP / 100).toFixed(2));
+          line('DISAGREEMENT', `${(Math.abs(res.divergenceP) / 100).toFixed(2)} points`);
+          console.log('');
+          console.log('  THE FEED IS WRONG. The chain is the market being traded, and the engine');
+          console.log('  builds its trend, its midpoints, its EMA filter and its at-the-money');
+          console.log('  strike out of the index level. DO NOT TRADE until these agree.');
+        } else {
+          console.log(`  feed ${(res.feedSpotP / 100).toFixed(2)} vs ${res.pairs} strikes pricing `
+            + `it at ${(res.impliedSpotP / 100).toFixed(2)} — `
+            + `${(Math.abs(res.divergenceP) / 100).toFixed(2)} points apart. They agree.`);
+        }
+      }
+    } catch (err) {
+      console.log(`  the cross-check could not run: ${err.message}`);
     }
   }
 
@@ -182,6 +263,10 @@ async function main() {
     console.log('  The gateway DOES quote the index. If the terminal still shows no spot,');
     console.log('  the winning instrument above is not the one the feed is using — check');
     console.log('  `index` in GET /api/terminal/status against the line marked PRICE.');
+    console.log('');
+    console.log('  A PRICE IS NOT A CORRECT PRICE. On 2026-08-02 this same line reported');
+    console.log('  25117.55 while the index was at 24383.60, and this script called that a');
+    console.log('  success — see the cross-check above.');
   } else if (!stored) {
     console.log('  No index price and no stored index row: sync instruments (the nse_cm file).');
   } else {

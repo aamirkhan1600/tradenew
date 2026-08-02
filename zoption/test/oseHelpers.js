@@ -56,6 +56,17 @@ function optionBar(over = {}) {
   };
 }
 
+// newdoc/ema.md — the number of completed candles the EMA confirmation filter
+// needs before it will pass anything: EMA20 first exists on the 20th, and the
+// crossover test needs the one before it.
+//
+// Exported as a NAME rather than baked into each fixture because it is the
+// reason every engine test that expects an entry feeds more than three candles.
+// A test that quietly used `series(3, …)` after this filter shipped would fail
+// with EMA_WARMING_UP and read as a broken entry path rather than as a stale
+// fixture.
+const EMA_WARMUP = require('../src/ose/constants').EMA_SLOW + 1;
+
 // A series of `n` index bars, each `step` paise above the last. Negative `step`
 // falls. Newest LAST, which is the order §10.1 and `lastN()` both use.
 function series(n, step, over = {}) {
@@ -72,6 +83,17 @@ function series(n, step, over = {}) {
     }));
   }
   return out;
+}
+
+// A series long enough and clean enough for BOTH trend filters to have an
+// opinion: the 3-candle engine and newdoc/ema.md's EMA9/EMA20. A monotone run of
+// `step` gives EMA9 above EMA20 with the close above both when rising, and the
+// mirror image when falling — a confirmed direction with no crossover inside the
+// cooldown and no crossing of EMA9 to read as chop.
+//
+// This is what an engine test that expects to REACH the entry path wants.
+function warmSeries(step, over = {}) {
+  return series(EMA_WARMUP + 3, step, over);
 }
 
 // A §6.1 OptionQuote in the shape chain.normalise() emits. Every optional field
@@ -157,6 +179,10 @@ function rules(over = {}) {
     liquidityMode: 'STRICT',
     premiumMinP: 1500,
     premiumMaxP: 2500,
+    // newdoc/ema.md §Position Exit Rule. Present because `derive()` puts it here
+    // — a fixture missing a key the real config carries is how an exit path ends
+    // up tested in a configuration that never ships.
+    emaExitOnCrossover: true,
     ...over,
   };
 }
@@ -190,6 +216,7 @@ function withOpenSession(fn) {
 }
 
 module.exports = {
-  ist, BASE_TS, indexBar, optionBar, series, quote, instrumentRow, trade, rules, gate,
+  ist, BASE_TS, EMA_WARMUP, indexBar, optionBar, series, warmSeries,
+  quote, instrumentRow, trade, rules, gate,
   withOpenSession,
 };

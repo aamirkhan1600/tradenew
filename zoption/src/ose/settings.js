@@ -45,8 +45,13 @@ const { ValidationError } = require('../core/errors');
 
 const PROFILE = 'ose';
 
+// The last warning set logged per profile — see load(). Module-scoped because the
+// engine reloads settings every five seconds through a fresh call.
+const _lastWarned = new Map();
+
 const MODES = ['PAPER', 'LIVE'];
 const LIQUIDITY_MODES = ['STRICT', 'LENIENT'];
+const SYNTHETIC_MODES = ['AUTO', 'OFF', 'FORCE'];
 
 // §5.1's table, verbatim, plus the marked additions.
 const DEFAULTS = {
@@ -86,6 +91,60 @@ const DEFAULTS = {
   // stepped over without firing, and of the two defensible positions this is the
   // one that fails closed. It can only ever close a position, never open one.
   stopGuardEnabled: true,
+
+  /* --- newdoc/ema.md, the EMA Trend Confirmation Engine -------------------- */
+  //
+  // The filter itself and its exit are switches rather than constants for one
+  // reason: ema.md calls the entry filter MANDATORY, so both ship ON, and an
+  // operator who turns either off has made a recorded decision rather than
+  // discovered a default. The four thresholds below them are tunable because
+  // the document specifies them in prose and gives no number for any — see
+  // `[MUST-CONFIRM #18]`.
+  emaFilterEnabled: true,
+  emaExitOnCrossover: true,
+  // Index POINTS, not premium points, and not paise. 0.25 is a quarter of one
+  // NIFTY point — see EMA_FLAT_P in ./constants.js for why the band exists at all.
+  emaFlatPoints: 0.25,
+  emaChopLookback: 6,
+  emaChopFlips: 3,
+  emaCrossCooldownCandles: 2,
+
+  /* --- the index-feed sanity check — see ./spotGuard.js -------------------- */
+  //
+  // Named spotCheck*, NOT spotGuard*, to keep it distinct from `stopGuardEnabled`
+  // (§16.4), which is a completely different mechanism about a completely
+  // different risk. Two settings one letter apart would be read wrong exactly
+  // once, at the worst moment.
+  //
+  // Ships ON. It cost this desk a silent 734-point index error that no log line,
+  // no preflight and no diagnostic caught.
+  spotCheckEnabled: true,
+  // Index POINTS. Generous on purpose: put-call parity over a two-day expiry and
+  // a stale far-OTM leg are worth a handful of points, never a hundred. The
+  // failure this exists for was 734.
+  spotCheckMaxDivergencePoints: 100,
+  // Below this many strikes quoting BOTH legs, the chain has no opinion and the
+  // check says so rather than guessing.
+  spotCheckMinPairs: 5,
+
+  /* --- the synthetic index — see ./syntheticIndex.js ----------------------- */
+  //
+  // What the engine does when the index feed and the option chain disagree.
+  //
+  //   AUTO   use the quoted index; fall back to the chain-derived level while
+  //          the two disagree, and switch back when they agree again
+  //   OFF    never derive. A divergent feed simply stops the engine (the
+  //          spot-check refuses the entry) — the behaviour before this existed
+  //   FORCE  always derive, even when the quoted index looks fine. For proving
+  //          the path works, not for a normal session
+  //
+  // AUTO ships, and on a healthy feed it does nothing at all.
+  syntheticIndexMode: 'AUTO',
+  // Strikes to derive from. Twelve legs sit comfortably inside NEO_QUOTE_BATCH
+  // (25) alongside the index and the held option, so this costs no extra HTTP
+  // request — the legs ride in the poll that was happening anyway.
+  syntheticIndexStrikes: 6,
+
   // Ids from §22 that the desk has signed off. LIVE mode refuses to start while
   // any remain unsigned — §22, first paragraph.
   confirmed: [],
@@ -140,7 +199,27 @@ function validate(raw) {
       errors.push(`${field} must be a whole number of ${min} or more`);
     }
   };
-  wholeAtLeast('initialTargetPoints', 1);
+  // §14.1 fixes the rung spacing: "level k: entryPrice − k points". The first
+  // target is therefore ALWAYS one point below the fill, and `ladder.targetPriceFor`
+  // implements exactly that — it takes a level, not a point count.
+  //
+  // §5.1 nevertheless lists this as tunable with `>= 1`, and the two cannot both
+  // be true. Until this was pinned, setting it to 3 changed the break-even panel
+  // on the settings page — which reads it — and changed NOTHING about the engine,
+  // which does not. The page would tell an operator a 3-point target needs a 41%
+  // win rate while the engine kept taking 1 point. A control that reports
+  // different economics from the ones being executed is worse than no control.
+  //
+  // Pinned rather than wired: making the ladder honour it would change §14.1's
+  // rung spacing, which is a specification decision and not a validation one.
+  // `targetExtensionPoints` is the knob that genuinely moves the ladder — it is
+  // read by `ladder.advanceTarget` and steps the rung by that many points.
+  if (Number(s.initialTargetPoints) !== 1) {
+    errors.push('initialTargetPoints must be 1 — §14.1 fixes the ladder at one point per rung '
+      + '("level k: entryPrice − k points") and the engine takes its first target from that, not '
+      + 'from this field. Any other value would change only the break-even figures on this page '
+      + 'and not a single order. Use targetExtensionPoints to move the ladder.');
+  }
   wholeAtLeast('initialStopPoints', 1);
   wholeAtLeast('targetExtensionPoints', 1);
   wholeAtLeast('premiumSafetyExitPoints', 1);
@@ -149,6 +228,16 @@ function validate(raw) {
   wholeAtLeast('maxConsecutiveLosses', 1);
   wholeAtLeast('indexMinTicks', 0);
   wholeAtLeast('optionMinTicks', 0);
+  wholeAtLeast('emaChopLookback', 0);
+  wholeAtLeast('emaChopFlips', 0);
+  wholeAtLeast('emaCrossCooldownCandles', 0);
+  positive('emaFlatPoints', { allowZero: true });
+  wholeAtLeast('spotCheckMinPairs', 1);
+  wholeAtLeast('syntheticIndexStrikes', 3);
+  if (!SYNTHETIC_MODES.includes(String(s.syntheticIndexMode).toUpperCase())) {
+    errors.push(`syntheticIndexMode must be one of ${SYNTHETIC_MODES.join(', ')}`);
+  }
+  positive('spotCheckMaxDivergencePoints');
 
   if (Number(s.maxOpenTrades) !== 1) {
     errors.push('maxOpenTrades must be 1 — §5.1 makes it a constant and §3.3 is built on it');
@@ -168,6 +257,24 @@ function validate(raw) {
   const range = Number(s.scanRange);
   if (!Number.isFinite(range) || range < 1 || range > 40 || Math.trunc(range) !== range) {
     errors.push('scanRange must be a whole number between 1 and 40');
+  }
+
+  // ema.md's chop rule counts SIDE CHANGES, so a window of n candles can hold at
+  // most n-1 of them. A threshold above that cannot ever be reached, which does
+  // not read as "the rule is off" anywhere — it reads as a configured filter
+  // that silently never fires. Refused rather than warned for that reason.
+  const chopLookback = Number(s.emaChopLookback);
+  const chopFlips = Number(s.emaChopFlips);
+  if (chopFlips > 0) {
+    if (chopLookback < 2) {
+      errors.push('emaChopLookback must be 2 or more while emaChopFlips is set — a window of '
+        + 'fewer than two candles cannot contain a crossing. Set emaChopFlips to 0 to turn the '
+        + 'chop rule off deliberately.');
+    } else if (chopFlips > chopLookback - 1) {
+      errors.push(`emaChopFlips (${chopFlips}) can never be reached inside emaChopLookback `
+        + `(${chopLookback}) candles — the maximum possible is ${chopLookback - 1}. A rule that `
+        + 'cannot fire is worse than one that is off, because nothing says so.');
+    }
   }
 
   const unknownIds = (s.confirmed || []).map(Number)
@@ -266,6 +373,91 @@ function validate(raw) {
     }
   }
 
+  /* --- newdoc/ema.md ------------------------------------------------------ */
+
+  // The warm-up, stated in the unit an operator restarting the process at 11:00
+  // actually cares about. EMA20 first exists on the 20th completed candle and
+  // the crossover test needs the one before it, so the filter is silent — and
+  // therefore NO ENTRY IS POSSIBLE — for the first 21 candles of every process
+  // life. That is 105 seconds, and it is the single most surprising consequence
+  // of adding this filter.
+  const warmCandles = C.EMA_SLOW + 1;
+  warnings.push(`the EMA filter needs ${warmCandles} completed ${s.timeframeSeconds}s candles `
+    + `before it will pass anything, so a restart costs about `
+    + `${Math.ceil(warmCandles * Number(s.timeframeSeconds))}s of no entries while EMA`
+    + `${C.EMA_FAST}/EMA${C.EMA_SLOW} warm up. The decision log says EMA_WARMING_UP throughout — `
+    + 'that is the filter working, not a stalled feed.');
+
+  if (!s.emaFilterEnabled) {
+    warnings.push('emaFilterEnabled is OFF. ema.md makes the EMA confirmation a MANDATORY entry '
+      + 'filter, so this configuration is the strategy WITHOUT its first trend filter: entries '
+      + 'are decided by the 3-candle trend and the midpoint break alone, and nothing is stopping '
+      + 'the engine selling into a sideways tape. Turn it back on unless this is a deliberate, '
+      + 'recorded comparison run.');
+  }
+  if (!s.emaExitOnCrossover) {
+    warnings.push('emaExitOnCrossover is OFF, so ema.md\'s §Position Exit Rule is not enforced: a '
+      + 'position whose EMA structure has inverted is held until the 3-candle trend break, the '
+      + 'position-validity filter or the stop takes it out instead. Those are usually FASTER, '
+      + 'which is why this is a warning rather than an error — but the crossover exit is the one '
+      + 'that survives a candle the cycle dropped.');
+  }
+
+  if (Number(s.emaFlatPoints) === 0) {
+    warnings.push('emaFlatPoints is 0, which reads ema.md\'s "EMA9 == EMA20" literally. Two '
+      + 'floating averages of different periods are essentially never equal, so the flat-market '
+      + 'rule will fire NEVER and the sideways filter is left with only its chop and crossover '
+      + 'halves. `[MUST-CONFIRM #18]` ships 0.25.');
+  } else if (Number(s.emaFlatPoints) > 5) {
+    warnings.push(`emaFlatPoints is ${s.emaFlatPoints} index points. On 5-second NIFTY bars EMA9 `
+      + 'and EMA20 are rarely further apart than that even in a strong move, so this band will '
+      + 'read most of the session as flat and the engine will sit idle. Check the EMA_SIDEWAYS '
+      + 'tally on /ose before trading it.');
+  }
+
+  if (Number(s.emaChopFlips) === 0) {
+    warnings.push('emaChopFlips is 0 — ema.md\'s "price is moving repeatedly above and below '
+      + 'EMA9" rule is OFF. The flat-band and fresh-crossover halves of the sideways filter still '
+      + 'apply.');
+  }
+  if (Number(s.emaCrossCooldownCandles) === 0) {
+    warnings.push('emaCrossCooldownCandles is 0 — ema.md\'s "EMA crossover has just occurred" '
+      + 'rule is OFF, so the engine may enter on the crossover candle itself, which is the moment '
+      + 'the separation between the two averages is smallest and least trustworthy.');
+  }
+
+  /* --- the index-feed sanity check ---------------------------------------- */
+
+  if (!s.spotCheckEnabled) {
+    warnings.push('spotCheckEnabled is OFF. Nothing then compares the index feed against the '
+      + 'option chain, and a gateway that answers with a plausible but WRONG index level — which '
+      + 'this account has done, by 734 points, with a 200 and no error — will drive the trend, '
+      + 'both midpoints, the EMA filter and the at-the-money strike without anything noticing.');
+  } else if (Number(s.spotCheckMaxDivergencePoints) > 300) {
+    warnings.push(`spotCheckMaxDivergencePoints is ${s.spotCheckMaxDivergencePoints} index `
+      + 'points. The failure this check exists for was 734 points, so a band this wide still '
+      + 'catches it — but a smaller error, which is the kind that looks plausible, will pass. '
+      + 'Put-call parity over a near expiry is worth single-digit points; 100 is the shipped '
+      + 'default and there is little reason to widen it.');
+  }
+
+  const synthMode = String(s.syntheticIndexMode).toUpperCase();
+  if (synthMode === 'FORCE') {
+    warnings.push('syntheticIndexMode is FORCE: the index is derived from option premiums even '
+      + 'when the quoted index is perfectly good. Every candle the strategy reads — its shape, '
+      + 'its midpoints, its EMA — is then a function of option prices rather than of the index. '
+      + 'That is a proving mode, not a trading one.');
+  } else if (synthMode === 'OFF') {
+    warnings.push('syntheticIndexMode is OFF: if the index feed goes wrong again the engine will '
+      + 'refuse entries and sit idle rather than deriving the level from the chain. That is the '
+      + 'safe answer and it was the behaviour before 2026-08-02 — just know it is a choice.');
+  } else {
+    warnings.push('syntheticIndexMode is AUTO. On a healthy feed this does nothing. If the index '
+      + 'and the chain disagree, the engine switches to a level derived from option premiums and '
+      + 'RESETS its candle buffer — which costs a full EMA warm-up (21 candles) at the switch, in '
+      + 'each direction. A feed that flaps would spend the session warming up.');
+  }
+
   const unsigned = C.MUST_CONFIRM_IDS.filter(id => !(s.confirmed || []).map(Number).includes(id));
   if (unsigned.length) {
     warnings.push(`§22: ${unsigned.length} of ${C.MUST_CONFIRM_IDS.length} MUST-CONFIRM items `
@@ -309,6 +501,41 @@ function derive(raw) {
       premiumMaxP: money.toPaise(s.premiumMax),
     }),
 
+    // The shape ./ema.js reads — `resolve()` there takes exactly these keys.
+    // Built once here for the same reason `_gate` is: the ENTRY filter and the
+    // crossover EXIT must see identical averages, or a position gets closed
+    // under a different indicator from the one that opened it.
+    _ema: Object.freeze({
+      enabled: Boolean(s.emaFilterEnabled),
+      exitOnCrossover: Boolean(s.emaExitOnCrossover),
+      emaFast: C.EMA_FAST,
+      emaSlow: C.EMA_SLOW,
+      emaFlatP: money.toPaise(s.emaFlatPoints),
+      emaChopLookback: Math.trunc(Number(s.emaChopLookback)),
+      emaChopFlips: Math.trunc(Number(s.emaChopFlips)),
+      emaCrossCooldown: Math.trunc(Number(s.emaCrossCooldownCandles)),
+      warmupCandles: C.EMA_SLOW + 1,
+    }),
+
+    // The shape ./spotGuard.js reads. Paise, converted once here, so no call
+    // site can convert index points differently.
+    _spotCheck: Object.freeze({
+      enabled: Boolean(s.spotCheckEnabled),
+      maxDivergenceP: money.toPaise(s.spotCheckMaxDivergencePoints),
+      minPairs: Math.trunc(Number(s.spotCheckMinPairs)),
+    }),
+
+    // The shape ./syntheticIndex.js and the engine's source switch read.
+    _synthetic: Object.freeze({
+      mode: String(s.syntheticIndexMode).toUpperCase(),
+      strikes: Math.trunc(Number(s.syntheticIndexStrikes)),
+      // Two poll intervals. A leg that has survived two polls without an update
+      // is one the gateway is not refreshing, and a stale leg moves `C − P` for
+      // a reason that is not the index.
+      maxSampleAgeMs: 2 * Math.max(1, config.neo.pollMs),
+      minStrikes: Math.max(3, Math.ceil(Math.trunc(Number(s.syntheticIndexStrikes)) / 2)),
+    }),
+
     // The shape ./exits.js and ./ladder.js read.
     _rules: Object.freeze({
       targetExtensionPoints: Math.trunc(Number(s.targetExtensionPoints)),
@@ -321,6 +548,9 @@ function derive(raw) {
       liquidityMode: String(s.liquidityMode).toUpperCase(),
       premiumMinP: money.toPaise(s.premiumMin),
       premiumMaxP: money.toPaise(s.premiumMax),
+      // ema.md §Position Exit Rule. Read by exits.onCandle(), which is handed
+      // `_rules` and nothing else.
+      emaExitOnCrossover: Boolean(s.emaExitOnCrossover),
     }),
 
     _risk: Object.freeze({
@@ -424,7 +654,22 @@ async function load(name = PROFILE) {
     throw new ValidationError(
       `the Option Selling Engine settings are invalid:\n  - ${errors.join('\n  - ')}`);
   }
-  for (const w of warnings) logger.warn('ose settings: ' + w);
+
+  // Logged only when the SET of warnings changes.
+  //
+  // `load()` is called on the engine's settings-reload timer every five seconds,
+  // and it used to re-log every warning on every call — seven lines each time,
+  // eighty-four a minute, for a configuration nobody had touched. It buried the
+  // lines that carry information: a source switch, a parity re-centre and a halt
+  // all scrolled past inside a wall of advice about premium safety exits.
+  //
+  // Keyed by the warnings themselves, not by a timer, so a change an operator
+  // just saved is still announced immediately.
+  const signature = `${name} ${warnings.join(' ')}`;
+  if (_lastWarned.get(name) !== signature) {
+    _lastWarned.set(name, signature);
+    for (const w of warnings) logger.warn('ose settings: ' + w);
+  }
 
   const derived = derive(raw);
   assertLiveAllowed(derived);
@@ -446,7 +691,7 @@ async function save(name, patch) {
 }
 
 module.exports = {
-  PROFILE, DEFAULTS, MODES, LIQUIDITY_MODES,
+  PROFILE, DEFAULTS, MODES, LIQUIDITY_MODES, SYNTHETIC_MODES,
   withDefaults, validate, derive,
   unsignedItems, assertLiveAllowed, breakevenNote,
   load, save,

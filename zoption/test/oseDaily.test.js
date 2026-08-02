@@ -222,3 +222,39 @@ test('an active session never triggers the login alert', async () => {
     }
   });
 });
+
+/* ------------------------------------- §17.7, the calendar FILE is readable -- */
+
+// The shipped `config/holidays.json` declared its list under `dates` while every
+// reader took `raw.holidays`. A calendar filled in exactly as the file's own note
+// instructed therefore parsed as EMPTY — a refusal to start in production, and a
+// silent "no holidays this year" everywhere else. The failure the file exists to
+// prevent, living inside the file.
+//
+// This asserts the real file, not a fixture: a fixture would have agreed with
+// whichever key the test author happened to pick.
+test('the shipped holiday calendar is actually readable by the engine', () => {
+  const fs = require('fs');
+  const config = require('../src/config');
+  const raw = JSON.parse(fs.readFileSync(config.ose.holidayFile, 'utf8'));
+
+  const list = risk.readCalendar(raw);
+  assert.ok(list.length > 0,
+    `config/holidays.json parsed to ${list.length} entries — the engine reads `
+    + `\`holidays\`; check the key`);
+
+  const today = require('../src/core/time').tradeDate(Date.now());
+  const verdict = risk.validateCalendar(list, today);
+  assert.equal(verdict.ok, true,
+    `the shipped calendar does not validate: ${verdict.reason}. In production this `
+    + 'is a refusal to start.');
+});
+
+test('readCalendar accepts every spelling that has ever been shipped', () => {
+  assert.equal(risk.readCalendar({ holidays: ['2026-12-25'] }).length, 1);
+  assert.equal(risk.readCalendar({ dates: ['2026-12-25'] }).length, 1, 'the legacy key');
+  assert.equal(risk.readCalendar(['2026-12-25']).length, 1, 'a bare array');
+  for (const junk of [null, undefined, 42, 'nope', {}, { holidays: 'no' }]) {
+    assert.deepEqual(risk.readCalendar(junk), [], `${JSON.stringify(junk)} must be empty, not throw`);
+  }
+});

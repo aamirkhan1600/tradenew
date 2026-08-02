@@ -1034,14 +1034,22 @@ const oseDecisions = {
          (cycle_id, trade_date, candle_ts, nifty_open_p, nifty_high_p, nifty_low_p,
           nifty_close_p, synthetic, low_confidence, tick_count,
           trend, trend_via, bullish_mid_p, bearish_mid_p,
+          ema9_p, ema20_p, ema_trend, ema_via, index_source, source,
           outcome, detail, selected_symbol, selection_score, state, latency_ms)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON DUPLICATE KEY UPDATE id = id`,
       [row.cycleId, row.tradeDate, row.candleTs,
         row.openP, row.highP, row.lowP, row.closeP, row.synthetic ? 1 : 0,
         row.lowConfidence ? 1 : 0, row.tickCount ?? 0,
         row.trend || 'NONE', row.trendVia ?? null,
         row.bullishMidP ?? null, row.bearishMidP ?? null,
+        // newdoc/ema.md. `?? null` and never `|| null`: an EMA that has landed
+        // exactly on 0 is a price, and `||` would store it as "no reading".
+        row.ema9P ?? null, row.ema20P ?? null,
+        row.emaTrend == null ? null : String(row.emaTrend).slice(0, 12),
+        row.emaVia == null ? null : String(row.emaVia).slice(0, 24),
+        row.indexSource == null ? null : String(row.indexSource).slice(0, 8),
+        String(row.source || 'LIVE').slice(0, 8),
         String(row.outcome).slice(0, 48),
         row.detail == null ? null : String(row.detail).slice(0, 255),
         row.selectedSymbol ?? null, row.selectionScore ?? null,
@@ -1061,11 +1069,30 @@ const oseDecisions = {
 
   // The question §21 exists to answer: what did the engine spend the session
   // refusing, and how often. One query rather than a log grep.
-  async outcomeTally(tradeDate) {
+  // `sinceMs` scopes the tally to the CURRENT ENGINE RUN, and `LIVE` excludes
+  // the replay and the self test.
+  //
+  // Both matter, and they fix different halves of the same complaint. Without
+  // the source filter the panel counts simulated entries as real ones. Without
+  // the run scope it carries a morning's refusals into an afternoon an operator
+  // has just restarted into, so "why is it not trading" is answered with reasons
+  // that stopped applying hours ago.
+  //
+  // The rows are NOT deleted on restart. §11.5 exists so a session's every
+  // refusal survives to be queried afterwards; a panel that is hard to read is a
+  // reason to scope the QUERY, never to throw the record away.
+  async outcomeTally(tradeDate, { sinceMs = null, source = 'LIVE' } = {}) {
+    const where = ['trade_date = ?'];
+    const args = [tradeDate];
+    if (source) { where.push('source = ?'); args.push(source); }
+    if (Number.isFinite(Number(sinceMs)) && Number(sinceMs) > 0) {
+      where.push('created_at >= FROM_UNIXTIME(?)');
+      args.push(Math.floor(Number(sinceMs) / 1000));
+    }
     return db.query(
       `SELECT outcome, COUNT(*) AS n, MAX(id) AS last_id
-         FROM ose_decisions WHERE trade_date = ?
-        GROUP BY outcome ORDER BY n DESC`, [tradeDate]);
+         FROM ose_decisions WHERE ${where.join(' AND ')}
+        GROUP BY outcome ORDER BY n DESC`, args);
   },
 
   // §23.1 — the latency budget, measured. p99 is approximated by ordering rather

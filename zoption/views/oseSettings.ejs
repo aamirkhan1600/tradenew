@@ -97,6 +97,121 @@
       </label>
     </div>
 
+    <!-- newdoc/ema.md — the EMA Trend Confirmation Engine. It runs BEFORE the
+         3-candle trend engine and can only ever refuse; nothing here selects a
+         strike or prices an order. -->
+    <h2>EMA trend filter <small>newdoc/ema.md — EMA 9 / EMA 20 on the 5s NIFTY candle</small></h2>
+    <div class="grid">
+      <label>EMA filter <span class="hint">ema.md calls it mandatory</span>
+        <select name="emaFilterEnabled">
+          <option value="true"  <%= settings.emaFilterEnabled ? 'selected' : '' %>>ON — an entry needs EMA confirmation first</option>
+          <option value="false" <%= settings.emaFilterEnabled ? '' : 'selected' %>>OFF — the 3-candle trend and midpoint alone</option>
+        </select>
+      </label>
+      <label>Crossover exit <span class="hint">§Position Exit Rule</span>
+        <select name="emaExitOnCrossover">
+          <option value="true"  <%= settings.emaExitOnCrossover ? 'selected' : '' %>>ON — close when EMA9 crosses back through EMA20</option>
+          <option value="false" <%= settings.emaExitOnCrossover ? '' : 'selected' %>>OFF — leave it to the trend break and the stop</option>
+        </select>
+      </label>
+      <label>Flat band (index points) <span class="hint">[MUST-CONFIRM #18]</span>
+        <input name="emaFlatPoints" type="number" step="0.05" min="0" value="<%= settings.emaFlatPoints %>">
+      </label>
+      <label>Crossover cooldown (candles)
+        <input name="emaCrossCooldownCandles" type="number" step="1" min="0" value="<%= settings.emaCrossCooldownCandles %>">
+      </label>
+      <label>Chop window (candles)
+        <input name="emaChopLookback" type="number" step="1" min="0" value="<%= settings.emaChopLookback %>">
+      </label>
+      <label>Chop crossings <span class="hint">of EMA9, inside that window</span>
+        <input name="emaChopFlips" type="number" step="1" min="0" value="<%= settings.emaChopFlips %>">
+      </label>
+    </div>
+    <p class="hint">
+      An entry needs <b>EMA9 &gt; EMA20 and the close above EMA9</b> to sell a PE, and the mirror
+      image to sell a CE — <i>and</i> the 3-candle trend engine has to agree. The three numbers
+      above are the market states the document rules out in words and gives no value for: the
+      averages being <b>indistinguishable</b> (flat band), the crossover being <b>too recent</b> to
+      trust, and price <b>crossing EMA9 repeatedly</b> inside a short window. Widen any of them and
+      the engine trades less; the <code>EMA_SIDEWAYS</code> tally on
+      <a href="/ose">the engine page</a> is the direct measure of what they cost today.
+    </p>
+    <p class="hint">
+      EMA20 first exists on the 20th completed candle and the crossover test needs the one before
+      it, so <b>no entry is possible for the first 21 candles</b> — about 105 seconds — after the
+      process starts or the feed comes back. The decision log reads
+      <code>EMA_WARMING_UP</code> throughout, and that is the filter working rather than a stalled
+      feed.
+    </p>
+
+    <!-- The index-feed sanity check. Added after this account's gateway answered
+         `nse_cm|Nifty 50` with 25117.55 while the index was at 24383.60 — a
+         734-point error served with a 200 and no error anywhere. -->
+    <h2>Index feed check <small>does the index agree with the chain it is trading?</small></h2>
+    <div class="grid">
+      <label>Feed check
+        <select name="spotCheckEnabled">
+          <option value="true"  <%= settings.spotCheckEnabled ? 'selected' : '' %>>ON — refuse to select a strike when they disagree</option>
+          <option value="false" <%= settings.spotCheckEnabled ? '' : 'selected' %>>OFF — trust the index feed</option>
+        </select>
+      </label>
+      <label>Max divergence (index points)
+        <input name="spotCheckMaxDivergencePoints" type="number" step="5" min="1" value="<%= settings.spotCheckMaxDivergencePoints %>">
+      </label>
+      <label>Minimum strike pairs <span class="hint">quoting both CE and PE</span>
+        <input name="spotCheckMinPairs" type="number" step="1" min="1" value="<%= settings.spotCheckMinPairs %>">
+      </label>
+    </div>
+    <p class="hint">
+      Every strike that quotes <b>both</b> legs is an independent reading of the index:
+      put-call parity gives <code>spot ≈ strike + (CE − PE)</code>. The engine takes the
+      <b>median</b> across the chain and compares it against the sealed index candle. Because that
+      second opinion moves <i>with</i> the market, a violent day does not trip it — only a feed
+      describing a different market does.
+      <b>On 2026-08-02 this account's index feed read 25117.55 while 41 strikes priced it at
+      24381.85.</b> At that spot the at-the-money strike computes as 25100 instead of 24400, so
+      every CE in the sellable band is marked in-the-money and refused. Nothing in the system
+      noticed until this check existed.
+    </p>
+    <p class="hint">
+      A disagreement blocks <b>new entries only</b> — an open position is still managed, because its
+      stop, target and premium floor are read from the option contract's own candle. The §13.3
+      position-validity filter <i>is</i> affected, so if you see <code>SPOT_DIVERGENCE</code> with a
+      position open, square off from the Kotak terminal rather than waiting.
+    </p>
+
+    <!-- The synthetic index. Added after this account's gateway served a
+         734-point-stale index for a whole session while its option quotes stayed
+         current to within ten points. -->
+    <h2>Synthetic index <small>the index, derived from the chain when the feed is wrong</small></h2>
+    <div class="grid">
+      <label>When the feed disagrees
+        <select name="syntheticIndexMode">
+          <option value="AUTO"  <%= settings.syntheticIndexMode === 'AUTO'  ? 'selected' : '' %>>AUTO — derive the index from the chain until the feed agrees again</option>
+          <option value="OFF"   <%= settings.syntheticIndexMode === 'OFF'   ? 'selected' : '' %>>OFF — never derive; the engine simply stops entering</option>
+          <option value="FORCE" <%= settings.syntheticIndexMode === 'FORCE' ? 'selected' : '' %>>FORCE — always derive, even from a healthy feed (proving only)</option>
+        </select>
+      </label>
+      <label>Strikes to derive from <span class="hint">both legs of each</span>
+        <input name="syntheticIndexStrikes" type="number" step="1" min="3" max="10" value="<%= settings.syntheticIndexStrikes %>">
+      </label>
+    </div>
+    <p class="hint">
+      Every strike that quotes <b>both</b> legs prices the index by put-call parity, and the
+      median across them is a level derived from the instruments the engine actually trades. The
+      legs ride in the <b>same one-second poll</b> the index and the held contract already use, so
+      this costs no extra request. Measured live on 2026-08-02 against a feed that was 734 points
+      wrong, six strikes returned <b>24384.10</b> against a true 24383.60 — and did so with the
+      window centred on the <i>wrong</i> spot, because parity holds at every strike.
+    </p>
+    <p class="hint">
+      <b>A source change throws the candle buffer away.</b> The two sources were 734 points apart,
+      and splicing one series onto the other would put a 734-point step in the middle of it that
+      the trend engine and the EMA would both read as a real move. So the buffer is cleared and
+      the averages re-warm — about <b>105 seconds of no entries</b> at every switch, in each
+      direction. The decision log records <code>index_source</code> on every row.
+    </p>
+
     <h2>Selection <small>§9 — and what this Kotak account can actually filter on</small></h2>
     <div class="grid">
       <label>Liquidity mode <span class="hint">[MUST-CONFIRM #13]</span>

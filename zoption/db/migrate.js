@@ -226,6 +226,37 @@ async function patch(conn) {
       'low_confidence TINYINT(1) NOT NULL DEFAULT 0 AFTER synthetic');
     await addColumn(conn, 'ose_decisions', 'tick_count',
       'tick_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER low_confidence');
+
+    // newdoc/ema.md — the EMA Trend Confirmation Engine.
+    //
+    // NULL on every row written before the filter existed, and that null is a
+    // meaningful value rather than a gap to be backfilled: those decisions were
+    // genuinely made without an EMA opinion. Anything comparing the strategy
+    // before and after must split on it rather than coalesce it to zero — a
+    // zero EMA is a price, and no price is not the same claim as no reading.
+    await addColumn(conn, 'ose_decisions', 'ema9_p',
+      'ema9_p DECIMAL(14,4) NULL AFTER bearish_mid_p');
+    await addColumn(conn, 'ose_decisions', 'ema20_p',
+      'ema20_p DECIMAL(14,4) NULL AFTER ema9_p');
+    await addColumn(conn, 'ose_decisions', 'ema_trend',
+      'ema_trend VARCHAR(12) NULL AFTER ema20_p');
+    await addColumn(conn, 'ose_decisions', 'ema_via',
+      'ema_via VARCHAR(24) NULL AFTER ema_trend');
+
+    // src/ose/syntheticIndex.js. NULL on rows written before the engine could
+    // derive an index at all — which is a different fact from 'FEED', and is
+    // left as null rather than backfilled to it.
+    await addColumn(conn, 'ose_decisions', 'index_source',
+      'index_source VARCHAR(8) NULL AFTER ema_via');
+
+    // Rows written before this column existed are marked LIVE by the DEFAULT,
+    // which is wrong for any replay row already in the table — but those are
+    // indistinguishable now and guessing would be worse. The panel is scoped to
+    // the current engine run as well, which excludes them either way.
+    await addColumn(conn, 'ose_decisions', 'source',
+      "source VARCHAR(8) NOT NULL DEFAULT 'LIVE' AFTER index_source");
+    await addIndex(conn, 'ose_decisions', 'idx_ose_decision_source',
+      'KEY idx_ose_decision_source (trade_date, source, created_at)');
   }
 }
 

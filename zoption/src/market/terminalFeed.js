@@ -56,6 +56,13 @@ const IDLE_STOP_MS = 45000;
 const VIX_INSTRUMENT = { token: 'India VIX', segment: 'nse_cm', byName: true };
 
 const paise = (rupees) => (rupees == null ? null : Math.round(Number(rupees) * 100));
+// How far the quoted index may sit from the chain's own view of it before the
+// quote is disbelieved. Generous: put-call parity gives the FORWARD, which sits
+// above the spot by a basis worth a few points on a near expiry and a few tens
+// on a monthly, and a display should not flap over that. The failure this exists
+// for was 734 points.
+const IMPLAUSIBLE_SPOT_GAP_P = 30000;      // 300 index points
+
 const rupees = (p) => (p == null ? null : Number(p) / 100);
 
 class TerminalFeed extends EventEmitter {
@@ -314,6 +321,59 @@ class TerminalFeed extends EventEmitter {
   // The ±range ladder around the money. Before the first spot arrives the window
   // is centred on the middle of the ladder — a chain that renders nothing until
   // the first tick would look broken for the first second of every session.
+  // Is a quoted index level consistent with the option chain?
+  //
+  // `true` when there is nothing to check against — an absent chain is not
+  // evidence that a quote is wrong, and refusing every tick until the chain
+  // arrives would leave the page blank on a cold start.
+  //
+  // The reference is the last DERIVED level, refreshed on every chain poll. On
+  // 2026-08-02 the gateway quoted 25117.55 against a chain pricing the index at
+  // 24382, and without this the header, the summary and the index CHART all
+  // carried the wrong number for a whole session.
+  _indexTickPlausible(ltpPaise) {
+    const reference = this.lastSyntheticPaise;
+    if (reference == null || !Number.isFinite(ltpPaise)) return true;
+    const gap = Math.abs(ltpPaise - reference);
+    if (gap <= IMPLAUSIBLE_SPOT_GAP_P) return true;
+
+    if (!this._tickGapSaid) {
+      this._tickGapSaid = true;
+      logger.error('terminalFeed: refusing index ticks — the quoted level disagrees with the '
+        + 'option chain, so it is not fed to the spot or to the chart.', {
+        underlying: this.underlying,
+        quoted: rupees(ltpPaise),
+        fromChain: rupees(reference),
+        gap: rupees(gap),
+      });
+    }
+    return false;
+  }
+
+  // Re-select the window once the money has walked off it.
+  //
+  // The window is ±`range` strikes around a centre chosen when it was last
+  // selected. A normal session drifts, and a chain whose centre is stale shows
+  // the wrong strikes and reports the wrong at-the-money row. Re-selecting is
+  // cheap — it re-filters an array already in memory and issues no request — but
+  // it is not free to do on every tick, so it waits until the drift is worth a
+  // third of the window.
+  _recentreIfDrifted() {
+    const spot = rupees(this.spotPaise);
+    if (spot == null || this.windowCentre == null) return;
+    const driftStrikes = Math.abs(spot - this.windowCentre) / this.strikeStep;
+    if (driftStrikes < Math.max(1, this.range / 3)) return;
+
+    const from = this.windowCentre;
+    this._selectWindow();
+    logger.info('terminalFeed: the chain window re-centred', {
+      underlying: this.underlying,
+      from,
+      to: this.windowCentre,
+      spot,
+    });
+  }
+
   _selectWindow() {
     const chain = this.fullChain || [];
     if (!chain.length) { this.chainInstruments.clear(); return; }
@@ -376,6 +436,14 @@ class TerminalFeed extends EventEmitter {
     for (const b of this.builders.values()) b.addTick(token, tick.ltpPaise, tick.ts);
 
     if (this.indexInstrument && token === String(this.indexInstrument.token)) {
+      // Refuse an index tick the option chain contradicts.
+      //
+      // Checked HERE, before the spot is stored and before `index_tick` is
+      // emitted, because this is the only place that stops a bad level reaching
+      // the chart. Checking it later only fixes the header and leaves the
+      // candles drawn from a price the market never traded at.
+      if (!this._indexTickPlausible(tick.ltpPaise)) return;
+
       const previous = this.spotPaise;
       this.spotPaise = tick.ltpPaise;
       this.spotSource = tick.source;
@@ -608,7 +676,6 @@ class TerminalFeed extends EventEmitter {
   _syntheticSpotPaise() {
     const T = greeks.yearsToExpiry(this.expiry);
     if (!T) return null;
-    const discount = Math.exp(-config.terminal.riskFreeRate * T);
 
     const byStrike = new Map();
     for (const row of this.chainInstruments.values()) {
@@ -622,7 +689,14 @@ class TerminalFeed extends EventEmitter {
     const usable = [];
     for (const [strike, legs] of byStrike) {
       if (legs.CE == null || legs.PE == null) continue;
-      usable.push({ strike, spread: Math.abs(legs.CE - legs.PE), spot: legs.CE - legs.PE + strike * discount });
+      // F = K + (C − P). THE STRIKE IS NOT DISCOUNTED — parity recovers the
+      // FORWARD, and discounting the strike without also discounting the spot by
+      // the index dividend yield biases the answer low by K·(1 − e^(−rT)).
+      // Measured on 25 both-legged strikes on 2026-08-02: K + (C − P) read
+      // 24381.90 against a true 24383.60, while the discounted form read
+      // 24373.75. Every strike agreed to ±0.5, so that was a systematic bias.
+      // Same correction as src/ose/spotGuard.js, for the same measured reason.
+      usable.push({ strike, spread: Math.abs(legs.CE - legs.PE), spot: legs.CE - legs.PE + strike });
     }
     if (!usable.length) return null;
 
@@ -634,29 +708,84 @@ class TerminalFeed extends EventEmitter {
     return paise(median);
   }
 
-  // A real quote always wins. The synthetic only stands in while none has
-  // arrived recently — otherwise a brief gateway hiccup would swap a quoted
-  // index for a derived one and leave it there for the session.
+  // A real quote wins — but only if it is PLAUSIBLE.
+  //
+  // This used to be "a real quote always wins", on the reasoning that a brief
+  // gateway hiccup should not swap a quoted index for a derived one and leave it
+  // there. That reasoning assumed the only failure mode was ABSENCE.
+  //
+  // On 2026-08-02 this account's gateway answered `nse_cm|Nifty 50` with
+  // 25117.55 while the index was at 24383.60 — a 734-point lie, served with a
+  // 200, arriving promptly every second. `quotedRecently` was true throughout,
+  // so the synthetic never stood in and this page showed the wrong index for a
+  // whole session while every option on it was priced correctly.
+  //
+  // So a fresh quote is now checked against the chain before it is believed. The
+  // chain is the market being displayed; if the index disagrees with it by more
+  // than a session's plausible basis, the index is what is wrong.
   _applySyntheticSpot() {
-    const quotedRecently = this.spotSource === 'quote'
-      && this.lastSpotAt && (Date.now() - this.lastSpotAt) < 10000;
-    if (quotedRecently) return;
-
     const synthetic = this._syntheticSpotPaise();
+    // The reference `_indexTickPlausible` judges quoted ticks against.
+    if (synthetic != null) this.lastSyntheticPaise = synthetic;
+
+    // ANY real quote, not just the chain poll's own.
+    //
+    // This used to test `spotSource === 'quote'`, which is only the value the
+    // chain poll sets — the TICKER sets 'ws' or 'rest'. So on a page fed by the
+    // ticker, which is the normal case, this branch never ran at all and the
+    // "a real quote always wins" rule it documents was not in force.
+    const quotedRecently = this.spotSource && this.spotSource !== 'synthetic'
+      && this.lastSpotAt && (Date.now() - this.lastSpotAt) < 10000;
+
+    if (quotedRecently) {
+      // Nothing to check it against — keep the quote, as before.
+      if (synthetic == null || this.spotPaise == null) return;
+      const gapPaise = Math.abs(this.spotPaise - synthetic);
+      if (gapPaise <= IMPLAUSIBLE_SPOT_GAP_P) return;
+
+      if (!this._spotGapSaid) {
+        this._spotGapSaid = true;
+        logger.error('terminalFeed: the quoted index disagrees with the option chain — showing '
+          + 'the chain level instead. The chain is the market being displayed, so the FEED is '
+          + 'what is wrong.', {
+          underlying: this.underlying,
+          quoted: rupees(this.spotPaise),
+          fromChain: rupees(synthetic),
+          gap: rupees(gapPaise),
+        });
+      }
+      // fall through and take the synthetic
+    } else {
+      this._spotGapSaid = false;
+    }
+
     if (synthetic == null) return;
 
     const previous = this.spotPaise;
+    const previousSource = this.spotSource;
     this.spotPaise = synthetic;
     this.spotSource = 'synthetic';
     this.lastSpotAt = Date.now();
+
     if (previous == null) {
       logger.warn('terminalFeed: the index cannot be quoted — deriving spot from the option '
         + 'chain by put-call parity. Run `node scripts/diagnose-spot.js` to find out why.',
       { underlying: this.underlying, spot: rupees(synthetic) });
-      // The first synthetic spot tells us where the money is, so the window can
-      // stop being centred on the middle of the ladder.
-      this._selectWindow();
     }
+
+    // RE-CENTRE the window, not just on the first synthetic spot.
+    //
+    // This used to run only when `previous == null`, which assumed the synthetic
+    // could only ever take over from nothing. Once it could also take over from a
+    // WRONG quote, that assumption broke: the window stayed centred where the bad
+    // feed had put it, and the page rendered a chain 700 points from the money
+    // while reporting the correct spot above it. The at-the-money row was wrong
+    // with it, because `atmStrike()` picks the nearest strike IN THE WINDOW.
+    //
+    // Observed exactly that: spot 24382.10, window centred 25100, ATM reported
+    // 24600.
+    if (previous == null || previousSource !== 'synthetic') this._selectWindow();
+    else this._recentreIfDrifted();
     // The chart gets it too, so the page shows a live price rather than an
     // em-dash. It is NOT fed to the candle builders: a derived series must not
     // end up persisted as this index's stored history.

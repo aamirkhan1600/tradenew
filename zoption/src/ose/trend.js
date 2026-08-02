@@ -27,6 +27,31 @@
 // Fail closed: an absence of information is not a reason to keep a naked short.
 //
 // ---------------------------------------------------------------------------
+// newdoc/paralle.md §Step 3 is SUPERSEDED — do not "fix" this to match it
+// ---------------------------------------------------------------------------
+//
+// That document defines the 3-candle trend as Higher High AND Higher Low AND
+// Higher Close (and the mirror image for bearish). This file does not implement
+// that, and the difference is deliberate: §10 of newdoc/update.md is the rule of
+// record, and the desk confirmed it on 2026-08-02.
+//
+// The two are not close. Measured over 20,000 generated 3-candle windows:
+//
+//     paralle.md (HH+HL+HC)   BULLISH 3800   BEARISH 4010   null 12188
+//     this file               BULLISH 9932   BEARISH 10066  null 0
+//
+//     agree 39.1%   disagree 60.9%   opposite directions 0
+//
+// They never point opposite ways — the disagreement is entirely that the HH/HL/HC
+// rule returns NO VERDICT where this one always has one. Adopting it would cut
+// entry opportunities by roughly 60%, and because §10.3 makes `null` a trend
+// break for an OPEN position, it would also exit far more often. That is a
+// different strategy, not a tidier statement of this one.
+//
+// `test/oseDecision.test.js` locks this so the substitution cannot be made
+// quietly.
+//
+// ---------------------------------------------------------------------------
 // Why the midpoint tie-break never divides
 // ---------------------------------------------------------------------------
 //

@@ -146,6 +146,13 @@
 .tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .tiles .tile { padding: 8px 10px; gap: 1px; }
 .tiles .tile .v { font-size: 15px; }
+/* The second line on a tile — the straddle's two legs, the expected-move range,
+   the time left to expiry. Small and muted: it is context for the number above
+   it, never a number to read on its own. Empty by default, and an empty span
+   must not reserve a line, or every tile without one sits taller than its
+   neighbours and the grid goes ragged. */
+.tiles .tile .sub { font-size: 10px; color: var(--muted); line-height: 1.3; }
+.tiles .tile .sub:empty { display: none; }
 .pane-summary h3 {
   margin: 16px 0 6px; font-size: 11px; text-transform: uppercase;
   letter-spacing: .6px; color: var(--muted); font-weight: 600;

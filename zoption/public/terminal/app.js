@@ -182,6 +182,40 @@ window.Z = window.Z || {};
     set('sm-expiry', data.expiry || '—');
     set('sm-lot', Z.fmtInt(s.lotSize));
     set('sm-vix', Z.fmt(s.vix));
+
+    /* --- what an ltp-only account CAN compute ---------------------------- */
+
+    set('sm-straddle', s.atmStraddle === null || s.atmStraddle === undefined
+      ? '—' : Z.fmt(s.atmStraddle));
+    Z.setText('sm-straddle-legs',
+      (s.atmCall == null || s.atmPut == null) ? ''
+        : 'CE ' + Z.fmt(s.atmCall) + ' + PE ' + Z.fmt(s.atmPut));
+
+    set('sm-move', s.expectedMovePct == null ? '—'
+      : '±' + (s.expectedMovePct * 100).toFixed(2) + '%');
+    Z.setText('sm-move-range',
+      (s.expectedMoveLow == null || s.expectedMoveHigh == null) ? ''
+        : Z.fmtInt(s.expectedMoveLow) + ' – ' + Z.fmtInt(s.expectedMoveHigh));
+
+    set('sm-iv', s.atmIv == null ? '—' : s.atmIv.toFixed(1) + '%');
+    // Positive skew is the normal state, so it is not coloured as "good" or
+    // "bad" — only signed, so an inversion is visible at a glance.
+    set('sm-skew', s.ivSkew == null ? '—'
+      : (s.ivSkew >= 0 ? '+' : '') + s.ivSkew.toFixed(1),
+    'v ' + (s.ivSkew == null ? '' : (s.ivSkew < 0 ? 'down' : '')));
+
+    Z.setText('sm-dte', s.daysToExpiry == null ? ''
+      : (s.daysToExpiry < 1
+        ? (s.daysToExpiry * 24).toFixed(1) + 'h to expiry'
+        : s.daysToExpiry.toFixed(1) + 'd to expiry'));
+
+    // HIDE what this entitlement cannot produce. A tile showing an em-dash
+    // forever is worse than no tile: it reads as "the market has no open
+    // interest today" rather than as "this account is not sent open interest".
+    const have = s.available || {};
+    document.querySelectorAll('.tiles .tile[data-need]').forEach(function (tile) {
+      tile.classList.toggle('hidden', have[tile.getAttribute('data-need')] !== true);
+    });
     set('sm-pcr', Z.fmt(s.pcr, 2), 'v ' + (s.pcr === null ? '' : s.pcr > 1 ? 'up' : 'down'));
     set('sm-maxpain', Z.fmtInt(s.maxPain));
     set('sm-calloi', Z.fmtCompact(s.totalCallOi));
@@ -191,6 +225,12 @@ window.Z = window.Z || {};
     // The banner is the honest half of this screen: it says which columns are
     // real before an operator reads a number off one that is not.
     const cover = data.coverage || {};
+
+    // The Index panel's OHLC rows, by the same rule as the tiles.
+    document.querySelectorAll('#ix-stats [data-need]').forEach(function (node) {
+      node.classList.toggle('hidden', cover[node.getAttribute('data-need')] !== true);
+    });
+
     const missing = ['oi', 'volume', 'bid', 'ask'].filter(f => cover[f] === false);
     const banner = Z.el('coverage');
     if (!banner) return;

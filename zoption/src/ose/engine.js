@@ -47,6 +47,10 @@ const instrumentMaster = require('../market/instrumentMaster');
 
 const C = require('./constants');
 const trendEngine = require('./trend');
+const emaEngine = require('./ema');
+const validator = require('./validation');
+const spotGuard = require('./spotGuard');
+const syntheticIndex = require('./syntheticIndex');
 const entry = require('./entry');
 const strikes = require('./strikes');
 const ladder = require('./ladder');
@@ -112,6 +116,17 @@ const OUTCOME = {
   MANAGING: 'MANAGING',
   COOLDOWN: 'COOLDOWN',
   CYCLE_EXCEPTION: 'CYCLE_EXCEPTION',
+
+  // newdoc/ema.md §Reject Trade. Re-exported from the EMA engine rather than
+  // restated, so the decision log and the filter can never drift apart on the
+  // spelling of a refusal the page groups its tally by.
+  EMA_WARMING_UP: emaEngine.OUTCOME.WARMING_UP,
+  EMA_SIDEWAYS: emaEngine.OUTCOME.SIDEWAYS,
+  EMA_FILTER_FAIL: emaEngine.OUTCOME.FILTER_FAIL,
+  EMA_TREND_CONFLICT: emaEngine.OUTCOME.CONFLICT,
+
+  // The index feed disagrees with the chain it is supposed to describe.
+  SPOT_DIVERGENCE: spotGuard.VERDICT.DIVERGED,
 };
 
 class OseEngine {
@@ -180,6 +195,32 @@ class OseEngine {
     this._maintainedDate = null;
     this._loginAlerted = false;
     this._feedDown = false;
+    // Latches the index-feed alert so it is said once per episode rather than
+    // once every five seconds — see `_noteSpotDivergence`.
+    this._spotDivergenceSaid = false;
+
+    // Where the index candle series is getting its prices — see
+    // ./syntheticIndex.js. 'FEED' is the quoted index; 'CHAIN' is put-call
+    // parity over subscribed option legs. Every decision row records it, because
+    // "was this trade decided on a derived index" is not a question to be
+    // answering from log timestamps a month later.
+    this.indexSource = 'FEED';
+    // Who is writing decision rows. 'LIVE' unless a script says otherwise —
+    // scripts/ose-replay.js and scripts/ose-selftest.js drive this same engine
+    // and their rows must be distinguishable from a real session's.
+    this.decisionSource = 'LIVE';
+    // When this run began. Published so the page can scope "why it is not
+    // trading" to THIS engine rather than to the whole calendar day.
+    this.startedAtMs = Date.now();
+    this.parityLegs = [];               // [{ strike, expiry, CE:{token}, PE:{token} }]
+    this.parityTokens = new Set();
+    this.paritySamples = new Map();     // token -> { ltpPaise, ts }
+    this._paritySelectedAt = null;
+    this._parityCentreP = null;
+    this._lastSyntheticP = null;
+    this._lastSyntheticAt = null;
+    this._sourceSwitchedAt = null;
+    this._feedSample = null;
 
     this.stats = { cycles: 0, entries: 0, exits: 0, overruns: 0, exceptions: 0 };
   }
@@ -234,6 +275,12 @@ class OseEngine {
       mode: this.cfg.mode,
       liquidityMode: this.cfg.liquidityMode,
       stopGuard: this.cfg._rules.stopGuardEnabled,
+      // newdoc/ema.md. On the boot line because the warm-up is the first thing
+      // an operator sees and the easiest to mistake for a dead feed: no entry is
+      // possible until this many candles have sealed.
+      emaFilter: this.cfg._ema.enabled
+        ? `EMA${C.EMA_FAST}/EMA${C.EMA_SLOW}, warm after ${this.cfg._ema.warmupCandles} candles`
+        : 'OFF',
     });
   }
 
@@ -260,7 +307,7 @@ class OseEngine {
       this.holidays = [];
       return;
     }
-    const list = Array.isArray(raw) ? raw : (raw.holidays || []);
+    const list = risk.readCalendar(raw);
     const verdict = risk.validateCalendar(list, time.tradeDate(Date.now()));
     if (!verdict.ok && config.isProd) throw new Error(`the holiday calendar is unusable: ${verdict.reason}`);
     if (!verdict.ok) logger.warn('ose: the holiday calendar is questionable', { reason: verdict.reason });
@@ -418,14 +465,189 @@ class OseEngine {
   _onTick(tick) {
     const token = String(tick.token);
     if (token === this.indexToken) {
-      this.indexCandles.addTick(token, tick.ltpPaise, tick.ts);
+      // Recorded whatever the source is: the quoted index is what the spot check
+      // judges, and it has to keep arriving even while it is being disbelieved.
+      this._feedSample = { ltpPaise: tick.ltpPaise, ts: tick.ts };
+      if (this.indexSource === 'FEED') {
+        this.indexCandles.addTick(token, tick.ltpPaise, tick.ts);
+      }
       return;
     }
+
+    // A parity leg. It may ALSO be the candidate or the held contract, so this
+    // records and falls through rather than returning — an option the engine is
+    // trading must still reach its own candle series.
+    if (this.parityTokens.has(token)) {
+      this.paritySamples.set(token, { ltpPaise: tick.ltpPaise, ts: tick.ts });
+      if (this.indexSource === 'CHAIN') this._feedSyntheticIndex(tick.ts);
+    }
+
     this.optionCandles.addTick(token, tick.ltpPaise, tick.ts);
     // §16.4 only. Kept in its own map, apart from the candle series, so that
     // nothing which is supposed to read sealed data can reach a live price by
     // accident.
     this.liveSample.set(token, { ltpPaise: tick.ltpPaise, ts: tick.ts });
+  }
+
+  /* ------------------------------------------- the synthetic index source --- */
+
+  // One parity leg ticked, so the derived level may have moved. Recomputed here
+  // rather than on a timer because the candle builder wants the intra-bucket
+  // PATH, not a sample of it: the highs and lows §11.2 takes its midpoints from
+  // only exist if the ticks that made them were delivered.
+  //
+  // An unchanged level is not fed again WITHIN a poll interval. Twelve legs
+  // arrive in one poll and most move the median by nothing, so emitting each
+  // would inflate `tickCount` — the very number §7.8 uses to judge whether a bar
+  // had enough evidence to price an order.
+  //
+  // But it is only suppressed for one interval, never indefinitely, and that
+  // distinction is load-bearing. Suppressing an unchanged level forever starves
+  // the candle builder the moment the market goes quiet: with a static chain the
+  // level never changes, no ticks are fed, no bucket ever seals, and the engine
+  // goes SILENT while looking perfectly healthy. Observed exactly that on a
+  // closed market — one decision row, then nothing.
+  //
+  // This is the rule `ticker._record` already applies to real quotes, for the
+  // same reason: an unchanged price still has to land once per interval or
+  // staleness becomes unmeasurable.
+  _feedSyntheticIndex(tsMs) {
+    const res = syntheticIndex.compute(this.parityLegs, this.paritySamples, {
+      nowMs: Date.now(),
+      maxSampleAgeMs: this.cfg._synthetic.maxSampleAgeMs,
+      minStrikes: this.cfg._synthetic.minStrikes,
+    });
+    if (res.levelP == null) return;
+
+    const now = Date.now();
+    const unchanged = res.levelP === this._lastSyntheticP;
+    const fresh = this._lastSyntheticAt != null && (now - this._lastSyntheticAt) < config.neo.pollMs;
+    if (unchanged && fresh) return;
+
+    this._lastSyntheticP = res.levelP;
+    this._lastSyntheticAt = now;
+    this.indexCandles.addTick(this.indexToken, res.levelP, tsMs ?? now);
+  }
+
+  // Which strikes to derive from, re-centred as the market moves.
+  //
+  // Selection tolerates a wrong centre on purpose — parity holds at every strike,
+  // so a window centred on a bad spot still returns the right level. That matters
+  // because the only spot available the first time this runs is the one under
+  // suspicion.
+  _selectParityLegs(spotP) {
+    const snap = this.chain.snapshot;
+    if (!snap?.quotes?.length) return;
+
+    // Re-centre only when the money has actually moved off the current window,
+    // or when there is no window at all. Re-subscribing every second would churn
+    // the ticker's subscription set for nothing.
+    const drift = this._parityCentreP == null || spotP == null
+      ? Infinity : Math.abs(spotP - this._parityCentreP);
+    const spread = this.cfg._synthetic.strikes * C.STRIKE_MULTIPLE * 100;
+    if (this.parityLegs.length && drift < spread / 3) return;
+
+    const legs = syntheticIndex.pickLegs(snap.quotes, {
+      spotP, count: this.cfg._synthetic.strikes,
+    });
+    if (legs.length < this.cfg._synthetic.minStrikes) return;
+
+    const next = syntheticIndex.tokensFor(legs);
+    const nextTokens = new Set(next.map(t => t.token));
+
+    // Drop only what is no longer wanted, and never the contract being traded.
+    for (const token of this.parityTokens) {
+      if (nextTokens.has(token)) continue;
+      if (this.trade && token === this.trade.token) continue;
+      if (this.candidate && token === this.candidate.token) continue;
+      this.ticker.unsubscribe?.([token]);
+      this.paritySamples.delete(token);
+    }
+
+    this.parityLegs = legs;
+    this.parityTokens = nextTokens;
+    this._parityCentreP = spotP;
+    this._paritySelectedAt = Date.now();
+    this.ticker.subscribe?.(next);
+
+    logger.info('ose: parity legs re-centred', {
+      strikes: legs.map(l => l.strike).join(','),
+      centre: money.formatPrice(spotP),
+    });
+  }
+
+  // FEED <-> CHAIN.
+  //
+  // THE CANDLE BUFFER IS THROWN AWAY ON EVERY SWITCH, and that is the whole
+  // reason this is a method rather than an assignment. The two sources were 734
+  // points apart on the day this was written; splicing one series onto the other
+  // would put a 734-point step in the middle of it, and the trend engine and the
+  // EMA would both read that step as the most violent move of the session and
+  // act on it. A gap in the record is recoverable. A fabricated move is not.
+  //
+  // The cost is honest and large: 21 candles — about 105 seconds — of
+  // EMA_WARMING_UP after every switch, in each direction. A feed that flaps
+  // would spend its session warming up, which is why the switch is decided on
+  // the settled spot check rather than on a single cycle's opinion.
+  _switchIndexSource(next, reason) {
+    if (next === this.indexSource) return;
+    const from = this.indexSource;
+    this.indexSource = next;
+    this._sourceSwitchedAt = Date.now();
+    this._lastSyntheticP = null;
+    this._lastSyntheticAt = null;
+
+    this.indexSeries.length = 0;
+    this.indexCandles.untrack(this.indexToken);
+    this.indexCandles.track(this.indexToken);
+    this.indexGap = 0;
+
+    logger.error(`ose: THE INDEX SOURCE CHANGED ${from} -> ${next}. The candle buffer has been `
+      + 'cleared, so no entry is possible until the averages warm up again.', {
+      reason,
+      warmUpCandles: this.cfg._ema.warmupCandles,
+      warmUpSeconds: this.cfg._ema.warmupCandles * Number(this.cfg.timeframeSeconds),
+    });
+  }
+
+  // Runs on the safety timer. Decides the source from the SETTLED spot check,
+  // and keeps the parity window centred.
+  async _maintainIndexSource() {
+    if (!this.cfg?._synthetic) return;
+    const mode = this.cfg._synthetic.mode;
+
+    if (mode === 'OFF') {
+      this._switchIndexSource('FEED', 'syntheticIndexMode is OFF');
+      return;
+    }
+
+    // The chain is what both the selection and the verdict come from. `snapshot`
+    // is refreshed by `_publishWatch` on this same timer.
+    const snap = this.chain.snapshot;
+    if (!snap?.quotes?.length) return;
+
+    const implied = spotGuard.impliedSpot(snap.quotes, this.cfg._spotCheck).spotP;
+    // Centre the window on the level we BELIEVE, which is the derived one
+    // whenever the feed is in doubt.
+    this._selectParityLegs(implied ?? this._feedSample?.ltpPaise ?? null);
+
+    if (mode === 'FORCE') {
+      this._switchIndexSource('CHAIN', 'syntheticIndexMode is FORCE');
+      return;
+    }
+
+    // AUTO. The feed has to be BOTH present and in agreement to be used.
+    const feedP = this._feedSample?.ltpPaise ?? null;
+    if (implied == null || feedP == null) return;      // no opinion, change nothing
+
+    const check = spotGuard.check(feedP, snap.quotes, this.cfg._spotCheck);
+    if (check.verdict === spotGuard.VERDICT.DIVERGED) {
+      this._switchIndexSource('CHAIN',
+        `the quoted index ${money.formatPrice(feedP)} disagrees with the chain's `
+        + `${money.formatPrice(implied)} by ${money.formatPrice(Math.abs(check.divergenceP))}`);
+    } else if (check.verdict === spotGuard.VERDICT.OK) {
+      this._switchIndexSource('FEED', 'the quoted index agrees with the chain again');
+    }
   }
 
   _onIndexCandle(bar) {
@@ -471,12 +693,22 @@ class OseEngine {
 
   async _cycle(candle) {
     this._cycleBusy = true;
-    const t0 = Date.now();
+    // `performance.now()`, not `Date.now()`. §23.1 budgets 100ms at p99 and the
+    // whole decision path is well under one MILLISECOND, so a clock with
+    // millisecond granularity reports every cycle as 0 and the budget is
+    // measured with an instrument that cannot see it.
+    const t0 = performance.now();
     const ctx = {
       cycleId: cryptoRandomId(),
       candle,
       ts: candle.bucketStart,
       tradeDate: time.tradeDate(Date.now()),
+      // Read by `_finish`. It has to be on the ctx BEFORE any `_finish` call,
+      // because the `finally` below runs AFTER the return expression has been
+      // evaluated — so the `ctx.latencyMs` set there is always too late for the
+      // row that was just written. Every latency_ms in this table was 0.000 for
+      // that reason: 3,104 rows measuring nothing.
+      startedAt: t0,
     };
     this.stats.cycles += 1;
 
@@ -532,7 +764,10 @@ class OseEngine {
       await this._failSafe(ctx, err);
       return await this._finish(ctx, OUTCOME.CYCLE_EXCEPTION, err.message);
     } finally {
-      ctx.latencyMs = Date.now() - t0;
+      // Kept for the overrun guard and for anything reading the ctx afterwards;
+      // the DECISION ROW takes its own reading from `startedAt` at the moment it
+      // is written, which is the number §23.1 actually asks for.
+      ctx.latencyMs = performance.now() - t0;
       this._cycleBusy = false;
     }
   }
@@ -544,14 +779,47 @@ class OseEngine {
     ctx.trend = verdict.trend;
     ctx.trendVia = verdict.via;
 
-    if (verdict.trend === null && verdict.via === 'WARMING_UP') {
-      return this._finish(ctx, OUTCOME.WARMING_UP, verdict.reason);
-    }
+    // newdoc/ema.md — the FIRST trend filter, and it runs on the same buffer the
+    // trend engine just read. `indexSeries` ends with `ctx.candle`, because
+    // `_onIndexCandle` pushes the sealed bar before it starts the cycle: the
+    // "current close" the EMA rules compare against is therefore this cycle's
+    // own candle, which is what "use only completed candles" means here.
+    //
+    // Evaluated ALWAYS, gated only when enabled. A verdict that costs two passes
+    // over a ring buffer and answers "what was the EMA doing when it refused" on
+    // every row of the decision log is worth more than the microseconds — and an
+    // operator comparing the filter on against off needs both columns populated.
+    const ema = emaEngine.evaluate(this.indexSeries, this.cfg._ema);
+    ctx.ema = ema;
 
+    // newdoc/paralle.md — all three validations run off THIS candle, then merge
+    // into one decision.
+    //
+    // The midpoint is evaluated unconditionally rather than only after the EMA
+    // filter has passed. It is a pure function of the candle's own OHLC costing
+    // under a microsecond, and computing it always means `bullishMidP` and
+    // `bearishMidP` are on EVERY decision row — including the ones the EMA
+    // refused, which is exactly where "how close was it" is the question being
+    // asked. They used to be null on those rows.
     const decision = entry.validate(ctx.candle, verdict.trend);
     ctx.bullishMidP = decision.bullishMidP;
     ctx.bearishMidP = decision.bearishMidP;
-    if (!decision.allowed) return this._finish(ctx, decision.reason, decision.detail);
+
+    // ONE gate. See the header of ./validation.js for why this is not a report
+    // built alongside the checks it describes.
+    const validation = validator.merge({
+      trend: verdict,
+      ema,
+      midpoint: decision,
+      emaEnabled: this.cfg._ema.enabled,
+    });
+    ctx.validation = validation;
+    // Kept for status(): the last merged decision, in paralle.md's shape.
+    this._lastValidation = validation;
+
+    if (!validation.entryAllowed) {
+      return this._finish(ctx, validation.reason, validation.detail);
+    }
 
     const gate = risk.canOpenTrade(this.counters, this.cfg._risk, {
       nowMs: Date.now(),
@@ -575,6 +843,36 @@ class OseEngine {
       }
       return this._finish(ctx, snap.reason, snap.detail || this.chain._lastError);
     }
+
+    // Before the spot is allowed to choose a strike, check that it describes the
+    // same market as the chain it is about to choose from — see ./spotGuard.js.
+    //
+    // HERE, and not earlier, because the check needs the chain: it is the option
+    // prices that hold the second opinion. That ordering costs one snapshot on a
+    // bad-feed cycle, which is the correct trade — the alternative is trusting an
+    // index level that nothing has ever cross-examined.
+    //
+    // This blocks NEW ENTRIES only. An open position keeps being managed, because
+    // its stop, target and premium floor are evaluated on the OPTION contract's
+    // own candle and are unaffected by a wrong index level. The §13.3 validity
+    // filter IS affected, and that limit is stated rather than papered over: a
+    // divergent feed makes the position filter unreliable in both directions, so
+    // an operator seeing this outcome with a position open should square off from
+    // the terminal rather than wait.
+    // Skipped when the index IS the chain: comparing a chain-derived level
+    // against the chain it came from can only ever agree, so running it would be
+    // a check that always passes wearing the name of one that means something.
+    // `_maintainIndexSource` is what watches the quoted feed in that mode.
+    const spotCheck = this.indexSource === 'CHAIN'
+      ? { ok: true, verdict: 'SPOT_FROM_CHAIN', impliedSpotP: ctx.candle.closeP, divergenceP: 0 }
+      : spotGuard.check(ctx.candle.closeP, snap.snapshot.quotes, this.cfg._spotCheck);
+    ctx.impliedSpotP = spotCheck.impliedSpotP;
+    ctx.spotDivergenceP = spotCheck.divergenceP;
+    if (!spotCheck.ok) {
+      this._noteSpotDivergence(spotCheck);
+      return this._finish(ctx, OUTCOME.SPOT_DIVERGENCE, spotCheck.reason);
+    }
+    this._spotDivergenceSaid = false;
 
     // `spotP` is the sealed index close — the same reference price §11 decided
     // on, never a live quote — and it is what tells the selector which strikes
@@ -668,6 +966,21 @@ class OseEngine {
           // different decision from "chosen on the full filter", and a year later
           // the row is the only place that difference survives.
           skipped: ctx.skipped ?? [],
+          // newdoc/ema.md — the state of the confirmation filter at the moment
+          // the trade was opened. On the trade rather than only in the decision
+          // log because the EXIT is judged against the same two averages, and
+          // "how far apart were they when this was sold" is the first question
+          // asked of a position the crossover closed two candles later.
+          ema: ctx.ema ? {
+            enabled: Boolean(this.cfg._ema.enabled),
+            trend: ctx.ema.trend,
+            via: ctx.ema.via,
+            ema9P: round4(ctx.ema.ema9P),
+            ema20P: round4(ctx.ema.ema20P),
+            separationP: round4(ctx.ema.separationP),
+            crossAge: ctx.ema.crossAge,
+            flips: ctx.ema.flips,
+          } : null,
         },
         settingsSnapshot: { mode: this.cfg.mode, liquidityMode: this.cfg.liquidityMode },
       });
@@ -733,6 +1046,13 @@ class OseEngine {
     ctx.trend = verdict.trend;
     ctx.trendVia = verdict.via;
 
+    // newdoc/ema.md §Position Exit Rule. Computed from the SAME buffer and the
+    // SAME configuration the entry used — `this.cfg` is held constant for the
+    // life of a position (see `_reloadSettings`), so the averages that let this
+    // trade in are the averages that decide when it leaves.
+    const ema = emaEngine.evaluate(this.indexSeries, this.cfg._ema);
+    ctx.ema = ema;
+
     const optionBar = this.optionLast.get(String(this.trade.token)) || null;
     const premiumP = optionBar ? optionBar.closeP : null;
     if (premiumP != null && this.trade.entryPriceP != null) {
@@ -752,6 +1072,7 @@ class OseEngine {
       optionCandle: optionBar,
       indexCandle: ctx.candle,
       trend: verdict.trend,
+      ema,
       quote,
       cfg: this.cfg._rules,
     });
@@ -813,6 +1134,25 @@ class OseEngine {
       candlesHeld: this.trade.candlesHeld,
       mfePoints: this.trade.mfePoints,
     }).catch(err => logger.warn('ose: the ladder patch was not persisted', { err: err.message }));
+  }
+
+  // Said ONCE per episode, at error level, not once every five seconds.
+  //
+  // A wrong index feed does not repair itself and the cycle re-detects it on
+  // every candle, so an unthrottled log would write 720 identical lines an hour
+  // and bury the one that matters. The decision log still records every refused
+  // cycle — that is what the `SPOT_DIVERGENCE` tally on /ose counts.
+  _noteSpotDivergence(check) {
+    if (this._spotDivergenceSaid) return;
+    this._spotDivergenceSaid = true;
+    logger.error('ose: THE INDEX FEED DISAGREES WITH THE OPTION CHAIN — no entry will be taken '
+      + 'until they agree. The chain is the market being traded, so the FEED is what is wrong. '
+      + 'Check the `ltp` line from scripts/diagnose-spot.js against a live NIFTY quote.', {
+      feedSpot: money.formatPrice(check.feedSpotP ?? null),
+      impliedSpot: money.formatPrice(check.impliedSpotP),
+      divergence: money.formatPrice(check.divergenceP),
+      strikesPricingIt: check.pairs,
+    });
   }
 
   // §16.2.4 — the premium safety exit firing WITHOUT the stop also firing means
@@ -899,6 +1239,11 @@ class OseEngine {
     await this._refreshIntent();
     await this._publishState();
     await this._publishWatch();
+    // AFTER the watch refresh, which is what keeps `chain.snapshot` current —
+    // the source decision and the leg selection both read it.
+    try { await this._maintainIndexSource(); } catch (err) {
+      logger.warn('ose: the index-source check failed', { err: err.message });
+    }
     await this._pollEntryFill();
     await this._pollExitFill();
 
@@ -1450,9 +1795,31 @@ class OseEngine {
     const bar = t ? this.optionLast.get(String(t.token)) : null;
     const premiumP = bar ? bar.closeP : null;
 
+    // What the CHAIN says the index is, alongside what the feed says.
+    //
+    // Published because a page showing only the feed shows a number that can be
+    // confidently, silently wrong — this account served 25117.55 against a true
+    // 24383.60 for a whole session. Two numbers and their disagreement is the
+    // difference between an operator seeing the market and seeing a lie.
+    //
+    // Costs nothing: `strikes.select` above already forced the snapshot, and the
+    // implied spot is a pure function of quotes already in hand.
+    let impliedP = null;
+    try {
+      if (snap?.quotes?.length) {
+        impliedP = spotGuard.impliedSpot(snap.quotes, this.cfg?._spotCheck || {}).spotP;
+      }
+    } catch (_) { /* a display field must never disturb the safety timer */ }
+
     const watch = {
       at: Date.now(),
       spot: spotP,
+      // Integer paise, and only when it actually disagrees — `system_flags.value`
+      // is VARCHAR(255) and this record is already close to it. A field that
+      // silently truncates the JSON would take the whole watch record down.
+      is: (impliedP != null && spotP != null
+        && Math.abs(spotP - impliedP) > (this.cfg?._spotCheck?.maxDivergenceP ?? 10000))
+        ? Math.round(impliedP) : undefined,
       ce: side('CE'),
       pe: side('PE'),
       // The held contract marked to the last sealed option bar — the same figure
@@ -1497,6 +1864,8 @@ class OseEngine {
       stale: this.chain._consecutiveStale,
       bars: this.indexSeries.length,
       cycles: this.stats.cycles,
+      // The run's start, so the page can tally only this engine's decisions.
+      up: this.startedAtMs,
       atMs: now,
     };
     const payload = JSON.stringify(slim);
@@ -1580,12 +1949,32 @@ class OseEngine {
       trendVia: ctx.trendVia ?? null,
       bullishMidP: ctx.bullishMidP ?? null,
       bearishMidP: ctx.bearishMidP ?? null,
+      // newdoc/ema.md. Stored on EVERY row, including the ones the EMA filter
+      // did not decide, because the question the decision log exists to answer
+      // is "what were the averages doing at 10:42:15" — and a column that is
+      // only populated on refusals cannot answer it about the entries.
+      //
+      // Fractional paise, deliberately unrounded until here: rounding the two
+      // averages independently before subtracting can flip the sign of a
+      // difference of one paise, and that difference is the crossover.
+      ema9P: round4(ctx.ema?.ema9P),
+      ema20P: round4(ctx.ema?.ema20P),
+      emaTrend: ctx.ema?.trend || (ctx.ema ? ctx.ema.state : null),
+      emaVia: ctx.ema?.via ?? null,
+      // Where the index behind this decision came from. On EVERY row, because
+      // "was this trade decided on a derived index" is not a question anyone
+      // should be answering from log timestamps a month later.
+      indexSource: this.indexSource,
+      source: this.decisionSource,
       outcome,
       detail,
       selectedSymbol: ctx.selectedSymbol ?? null,
       selectionScore: ctx.selectionScore ?? null,
       state: this.machine.current,
-      latencyMs: ctx.latencyMs ?? (Date.now() - (ctx.startedAt ?? Date.now())),
+      // Measured HERE — when the decision is recorded — rather than trusting a
+      // field the `finally` has not set yet. Rounded to the column's DECIMAL(9,3).
+      latencyMs: Math.round(
+        (ctx.latencyMs ?? (performance.now() - (ctx.startedAt ?? performance.now()))) * 1000) / 1000,
     }).catch(() => { /* async queue; never blocks */ });
     return { outcome, detail };
   }
@@ -1600,6 +1989,9 @@ class OseEngine {
       tradesToday: this.counters.tradesToday,
       consecutiveLosses: this.counters.consecutiveLosses,
       indexCandles: this.indexSeries.length,
+      indexSource: this.indexSource,
+      validation: this._lastValidation,
+      parityStrikes: this.parityLegs.map(l => l.strike),
       candidate: this.candidate?.symbol ?? null,
       position: this.trade ? {
         symbol: this.trade.symbol,
@@ -1630,7 +2022,24 @@ function settingsFingerprint(cfg) {
     cfg._rules.trailingStopEnabled, cfg._rules.stopGuardEnabled,
     cfg.initialTargetPoints, cfg.initialStopPoints,
     cfg._risk.maxTradesPerDay, cfg._risk.maxConsecutiveLosses, cfg._risk.tradeOnExpiryDay,
+    // newdoc/ema.md. Every one of these changes which candles are tradable, so
+    // leaving them out would let an operator retune the EMA filter and have the
+    // running engine quietly ignore it — the exact defect `_reloadSettings`
+    // exists to prevent.
+    cfg._ema.enabled, cfg._ema.exitOnCrossover, cfg._ema.emaFlatP,
+    cfg._ema.emaChopLookback, cfg._ema.emaChopFlips, cfg._ema.emaCrossCooldown,
+    // The index-feed check decides whether a cycle may select at all.
+    cfg._spotCheck.enabled, cfg._spotCheck.maxDivergenceP, cfg._spotCheck.minPairs,
+    cfg._synthetic.mode, cfg._synthetic.strikes,
   ]);
+}
+
+// EMA values are fractional paise and the decision column is DECIMAL(14,4).
+// Rounded HERE, at the storage boundary and nowhere earlier, so every comparison
+// the engine made ran on the full-precision numbers.
+function round4(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  return Math.round(value * 10000) / 10000;
 }
 
 function cryptoRandomId() {

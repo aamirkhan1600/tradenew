@@ -33,6 +33,7 @@ const C = require('./constants');
 const ladder = require('./ladder');
 const entry = require('./entry');
 const strikes = require('./strikes');
+const emaEngine = require('./ema');
 
 const EXIT_REASONS = {
   STOP_HIT: 'EXIT_STOP_HIT',
@@ -41,6 +42,12 @@ const EXIT_REASONS = {
   MAX_HOLD: 'EXIT_MAX_HOLD',
   FILTER_FAIL: 'EXIT_FILTER_FAIL',
   TREND_BREAK: 'EXIT_TREND_BREAK',
+  // newdoc/ema.md §Position Exit Rule. Recorded DISTINCTLY from TREND_BREAK on
+  // purpose: the two filters are independent and disagree often, and the count
+  // of trades the EMA closed before the 3-candle engine noticed is the only
+  // measure of what this filter is contributing. A shared reason code would
+  // erase it.
+  EMA_CROSS: 'EXIT_EMA_CROSS',
   PREMIUM_FLOOR: 'EXIT_PREMIUM_FLOOR',
   FEED_GAP: 'EXIT_FEED_GAP',
   OPTION_FEED_GAP: 'EXIT_OPTION_FEED_GAP',
@@ -80,6 +87,12 @@ const PRIORITY = Object.freeze({
   [EXIT_REASONS.PREMIUM_SAFETY]: 2,
   [EXIT_REASONS.LIQUIDITY]: 3,
   [EXIT_REASONS.MAX_HOLD]: 4,
+  // Ahead of the other two structure exits by one rung. All three say the same
+  // kind of thing — "the reason this position was opened has gone" — and when
+  // more than one fires on a candle the EMA crossover is the one worth
+  // recording, because it is the slowest of the three to appear and therefore
+  // the most informative when it appears first.
+  [EXIT_REASONS.EMA_CROSS]: 4,
   [EXIT_REASONS.FILTER_FAIL]: 5,
   [EXIT_REASONS.TREND_BREAK]: 5,
 });
@@ -168,8 +181,15 @@ function liquidityBroken(quote, cfg = {}) {
 //   2. premium safety exit              §16.2.4
 //   3. liquidity deterioration          §16.2 #3
 //   4. maximum holding time             §16.2 #4
+//   4b. EMA9/EMA20 crossover            newdoc/ema.md §Position Exit Rule
 //   5. position validity filter         §13.3
 //   6. target reached -> extend         §14
+//
+// The EMA crossover is inserted at 4b rather than appended, and the placement is
+// the whole of its meaning: ahead of the §13.3 validity filter, so that when a
+// candle breaks both, the reason recorded is the structural one. §13.3 fails on
+// an ordinary consolidation candle and fires constantly; the crossover is rare
+// and says something the validity filter does not.
 //
 // Returns `{ exit, extend, checks }`. `exit` is an exit reason with its detail,
 // or null. `extend` is the ladder patch from §14.2, or null. They are never both
@@ -181,9 +201,10 @@ function liquidityBroken(quote, cfg = {}) {
 //   optionCandle the sealed option candle for the held symbol (may be null)
 //   indexCandle  the sealed index candle driving this cycle
 //   trend        the §10 verdict, 'BULLISH' | 'BEARISH' | null
+//   ema          the newdoc/ema.md verdict for the same candle, or null
 //   quote        the current chain snapshot row for the held contract, or null
 //   cfg          derived settings
-function onCandle({ trade, optionCandle, indexCandle, trend, quote, cfg = {} }) {
+function onCandle({ trade, optionCandle, indexCandle, trend, ema = null, quote, cfg = {} }) {
   const checks = [];
   const note = (name, hit, detail) => { checks.push({ name, hit, detail }); return hit; };
 
@@ -237,6 +258,21 @@ function onCandle({ trade, optionCandle, indexCandle, trend, quote, cfg = {} }) 
   if (note('maxHold', (trade.candlesHeld || 0) >= maxHold)) {
     return fire(EXIT_REASONS.MAX_HOLD,
       `held for ${trade.candlesHeld} candles, the maximum is ${maxHold}`);
+  }
+
+  /* 4b — newdoc/ema.md §Position Exit Rule. A short PE was sold into EMA9 above
+        EMA20; a short CE into EMA9 below it. When that inverts, the structure
+        the trade was sold into has ended.
+
+        Evaluated on the RELATIONSHIP rather than on the crossover candle — see
+        the long note above `isBreak` in ./ema.js. Silent while the averages are
+        warming up, which is the one place this differs from the trend break:
+        the EMA line is a second opinion, and §13.3 and the trend break are both
+        still judging the same candle. */
+  const emaBreak = cfg.emaExitOnCrossover === false
+    ? { broken: false } : emaEngine.isBreak(ema, trade.optionType);
+  if (note('emaCross', Boolean(emaBreak.broken), emaBreak.reason)) {
+    return fire(EXIT_REASONS.EMA_CROSS, emaBreak.reason, { fresh: Boolean(emaBreak.fresh) });
   }
 
   /* 5 and 6 — the position validity filter. A trend break and a midpoint failure

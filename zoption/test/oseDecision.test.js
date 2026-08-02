@@ -235,3 +235,68 @@ test('stop: fires on the candle HIGH, not the close', () => {
   assert.equal(ladder.stopHit(h.optionBar({ highP: 2200, closeP: 2000 }), trade.stopPriceP), true);
   assert.equal(ladder.stopHit(h.optionBar({ highP: 2199, closeP: 2150 }), trade.stopPriceP), false);
 });
+
+/* ============ §10 vs newdoc/paralle.md §Step 3 — the ruling, locked ========= */
+
+// paralle.md §Step 3 defines the 3-candle trend as Higher High AND Higher Low
+// AND Higher Close. §10 of newdoc/update.md defines it as close drift with two
+// tie-breaks, and on 2026-08-02 the desk ruled that §10 wins.
+//
+// This exists because the two documents disagree in a way that looks like a bug
+// in the code: a reader with paralle.md open sees a "clearly wrong" trend engine
+// and fixes it. Measured over 20,000 windows the substitution would cut entry
+// opportunities by ~60% and, since §10.3 makes `null` a trend break for an open
+// position, exit far more often.
+//
+// A comment can be read past. A red test cannot.
+test('§10 wins over paralle.md §Step 3 — the trend is CLOSE DRIFT, not HH+HL+HC', () => {
+  // A window that RISES on close but does NOT make higher highs and higher lows.
+  // paralle.md would call this undetermined; §10 calls it BULLISH.
+  const notHigherHighs = [
+    h.indexBar({ bucketStart: h.BASE_TS, openP: 2450000, highP: 2450900, lowP: 2449000, closeP: 2450100 }),
+    h.indexBar({ bucketStart: h.BASE_TS + 5000, openP: 2450100, highP: 2450600, lowP: 2449500, closeP: 2450300 }),
+    h.indexBar({ bucketStart: h.BASE_TS + 10000, openP: 2450300, highP: 2450500, lowP: 2449200, closeP: 2450700 }),
+  ];
+
+  const [c1, c2, c3] = notHigherHighs;
+  assert.ok(!(c3.highP > c2.highP && c2.highP > c1.highP),
+    'the fixture must NOT make higher highs, or it proves nothing');
+  assert.ok(!(c3.lowP > c2.lowP && c2.lowP > c1.lowP),
+    'nor higher lows');
+  assert.ok(c3.closeP > c1.closeP, 'but the close must have risen across the window');
+
+  const verdict = trendEngine.evaluate(notHigherHighs, 3);
+  assert.equal(verdict.trend, 'BULLISH',
+    'if this is null, someone has implemented paralle.md §Step 3 — that section is '
+    + 'SUPERSEDED, see the header of src/ose/trend.js');
+  assert.equal(verdict.via, trendEngine.VIA.CLOSE);
+});
+
+test('§10 always reaches a verdict where paralle.md §Step 3 would abstain', () => {
+  // The whole measured difference between the two rules: HH+HL+HC returns no
+  // verdict 61% of the time. §10 returns null only on a PERFECT tie.
+  let nulls = 0;
+  let seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+
+  for (let i = 0; i < 2000; i += 1) {
+    const bars = [];
+    let px = 2438360;
+    for (let k = 0; k < 3; k += 1) {
+      px += Math.round((rand() - 0.5) * 500);
+      const open = px - Math.round((rand() - 0.5) * 120);
+      bars.push(h.indexBar({
+        bucketStart: h.BASE_TS + k * 5000,
+        openP: open,
+        highP: Math.max(open, px) + Math.round(rand() * 90),
+        lowP: Math.min(open, px) - Math.round(rand() * 90),
+        closeP: px,
+      }));
+    }
+    if (trendEngine.evaluate(bars, 3).trend === null) nulls += 1;
+  }
+
+  assert.equal(nulls, 0,
+    `§10 abstained on ${nulls} of 2000 random windows — it should abstain only on a `
+    + 'perfect tie. A high count means the HH+HL+HC rule has been substituted.');
+});

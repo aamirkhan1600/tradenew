@@ -80,6 +80,26 @@ function isPastSquareOff(nowMs) {
 //
 // "Stale" means the list does not reach the end of the current year — a calendar
 // that ran out in December is a calendar nobody maintained.
+// The one place the holiday FILE is turned into a list.
+//
+// It exists because the file and the code disagreed about the key. Both readers
+// took `raw.holidays`; the shipped file declared `dates` and its own note told
+// the operator to fill `dates`. A calendar written exactly as instructed would
+// therefore have read as EMPTY — which in production is a refusal to start, and
+// in development is a silent "no holidays this year". That is precisely the
+// failure the file exists to prevent, hiding inside the file itself.
+//
+// Both spellings are accepted, and a bare array still works. Anything that reads
+// the calendar goes through here so a third reader cannot invent a fourth
+// convention.
+function readCalendar(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (!raw || typeof raw !== 'object') return [];
+  if (Array.isArray(raw.holidays)) return raw.holidays;
+  if (Array.isArray(raw.dates)) return raw.dates;
+  return [];
+}
+
 function validateCalendar(holidays, todayIso) {
   const dates = Array.isArray(holidays)
     ? holidays.map(h => String(typeof h === 'string' ? h : h?.date ?? '').slice(0, 10))
@@ -226,6 +246,7 @@ module.exports = {
   VERDICTS,
   blankCounters, needsDayReset,
   isSessionOpen, isEntryWindowClosed, isPastSquareOff, isWeekend,
+  readCalendar,
   validateCalendar, isHoliday,
   canOpenTrade, foldClosedTrade,
 };

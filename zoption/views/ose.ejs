@@ -28,6 +28,15 @@
       <b id="trend" class="v">—</b>
       <span class="sub" id="trendsub"></span>
     </div>
+    <!-- newdoc/ema.md. The FIRST filter every entry has to clear, so an idle
+         session is explained here before it is explained anywhere else: "the
+         trend is BULLISH but the EMAs are 0.08 apart" is a completely different
+         situation from "nothing is happening", and only this tile says which. -->
+    <div class="tile">
+      <span class="k">EMA 9 / 20</span>
+      <b id="ema" class="v">—</b>
+      <span class="sub" id="emasub"></span>
+    </div>
     <div class="tile">
       <span class="k">Bearish mid</span>
       <b id="bearmid" class="v">—</b>
@@ -99,7 +108,7 @@
        a flat P&L, which is the single most expensive ambiguity this platform can
        have. §11.5 writes one row per sealed candle precisely so this can exist. -->
   <section class="card">
-    <h2>Why it is not trading <small>every decision today, by outcome</small></h2>
+    <h2>Why it is not trading <small id="outcomes-scope">every decision this engine has made, by outcome</small></h2>
     <div id="outcomes" class="tally"><span class="muted">—</span></div>
   </section>
 
@@ -184,12 +193,12 @@
     <table class="events" id="decisions">
       <thead>
         <tr>
-          <th>Time</th><th>Outcome</th><th>Trend</th><th>Type</th>
+          <th>Time</th><th>Outcome</th><th>Trend</th><th>EMA</th><th>Type</th>
           <th>Open</th><th>High</th><th>Low</th><th>Close</th>
           <th>Bear mid</th><th>Bull mid</th><th>Samples</th><th>Detail</th>
         </tr>
       </thead>
-      <tbody><tr><td colspan="12" class="muted">—</td></tr></tbody>
+      <tbody><tr><td colspan="13" class="muted">—</td></tr></tbody>
     </table>
     </div>
   </section>
@@ -303,17 +312,44 @@ async function refresh() {
   // The strategy in four numbers, from the most recent SEALED candle — the same
   // data the engine decided on, not a live quote it is not allowed to read.
   const m = s.market;
-  el('spot').textContent = m ? rupees(m.closeP) : '—';
-  el('spotsub').textContent = m
-    ? m.at + ' · ' + m.tickCount + ' sample' + (m.tickCount === 1 ? '' : 's')
-      + (m.synthetic ? ' · synthetic' : (m.lowConfidence ? ' · thin' : ''))
-    : 'no sealed candle yet';
-  el('spotsub').className = 'sub' + (m && (m.synthetic || m.lowConfidence) ? ' stale' : '');
+
+  // When the index feed disagrees with the option chain, the chain wins the
+  // tile. The feed's number is still shown, because "the broker is telling us
+  // 25117.55" is the fact an operator needs in order to act — but it must not
+  // be the headline, or the page reports a level the market never traded at.
+  const stale = s.watch && s.watch.feedStale && s.watch.impliedSpotP != null;
+  if (stale) {
+    el('spot').textContent = rupees(s.watch.impliedSpotP);
+    el('spot').className = 'v down';
+    el('spotsub').textContent = 'from the option chain — the index FEED says '
+      + rupees(m ? m.closeP : s.watch.spotP) + ', which is wrong';
+    el('spotsub').className = 'sub stale';
+  } else {
+    el('spot').textContent = m ? rupees(m.closeP) : '—';
+    el('spot').className = 'v';
+    el('spotsub').textContent = m
+      ? m.at + ' · ' + m.tickCount + ' sample' + (m.tickCount === 1 ? '' : 's')
+        + (m.synthetic ? ' · synthetic' : (m.lowConfidence ? ' · thin' : ''))
+      : 'no sealed candle yet';
+    el('spotsub').className = 'sub' + (m && (m.synthetic || m.lowConfidence) ? ' stale' : '');
+  }
 
   el('trend').textContent = m ? m.trend : '—';
   el('trend').className = 'v ' + (m && m.trend === 'BULLISH' ? 'up'
     : (m && m.trend === 'BEARISH' ? 'down' : ''));
   el('trendsub').textContent = m && m.trendVia ? m.trendVia.toLowerCase().replace(/_/g, ' ') : '';
+
+  // newdoc/ema.md. The tile shows the VERDICT and the separation, because the
+  // two averages quoted to four decimals say nothing an operator can act on
+  // while "0.08 apart — flat band" says exactly why nothing is trading.
+  el('ema').textContent = m && m.emaTrend ? m.emaTrend : '—';
+  el('ema').className = 'v ' + (m && m.emaTrend === 'BULLISH' ? 'up'
+    : (m && m.emaTrend === 'BEARISH' ? 'down' : ''));
+  el('emasub').textContent = (m && m.ema9P != null)
+    ? lvl(m.ema9P) + ' / ' + lvl(m.ema20P)
+      + ' · ' + (m.emaSeparationP >= 0 ? '+' : '') + lvl(m.emaSeparationP) + ' apart'
+      + (m.emaVia ? ' · ' + m.emaVia.replace(/^EMA_/, '').toLowerCase().replace(/_/g, ' ') : '')
+    : (m ? 'warming up — 21 candles needed' : '');
 
   el('bearmid').textContent = m ? rupees(m.bearishMidP) : '—';
   el('bullmid').textContent = m ? rupees(m.bullishMidP) : '—';
@@ -358,6 +394,14 @@ async function refresh() {
   }
 
   const tally = s.outcomes || [];
+  // Say WHICH decisions are being counted. A tally that silently changed scope
+  // on a restart would be read as the engine having forgotten its morning.
+  if (s.outcomesScope) {
+    const since = s.outcomesScope.sinceMs;
+    el('outcomes-scope').textContent = since
+      ? 'since this engine started at ' + new Date(since).toLocaleTimeString() + ', by outcome'
+      : 'every decision today, by outcome';
+  }
   el('outcomes').innerHTML = tally.length
     ? tally.map(o => '<span class="pill' + (o.outcome === 'ENTRY_TAKEN' ? ' on' : '') + '">'
         + esc(o.outcome) + ' <b>' + o.n + '</b></span>').join('')
@@ -436,7 +480,7 @@ async function refreshDecisions() {
   const r = await (await fetch('/api/ose/decisions?limit=10')).json();
   const body = document.querySelector('#decisions tbody');
   if (!r.ok || !r.decisions.length) {
-    body.innerHTML = '<tr><td colspan="12" class="muted">no decisions yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" class="muted">no decisions yet</td></tr>';
     return;
   }
   body.innerHTML = r.decisions.map(d => {
@@ -446,6 +490,17 @@ async function refreshDecisions() {
       + '<td>' + esc(d.at) + '</td>'
       + '<td class="' + (d.outcome === 'ENTRY_TAKEN' ? 'up' : '') + '">' + esc(d.outcome) + '</td>'
       + '<td>' + esc(d.trend) + (d.trendVia ? ' <small class="muted">' + esc(d.trendVia) + '</small>' : '') + '</td>'
+      // newdoc/ema.md. The SEPARATION rather than the two averages: the pair is
+      // eight digits wide and says nothing, while its difference is the whole
+      // of what every rule in that document compares. Null on rows written
+      // before the filter existed — left blank rather than shown as 0.00, which
+      // would read as "the averages were level".
+      + '<td class="' + (d.emaTrend === 'BULLISH' ? 'up' : (d.emaTrend === 'BEARISH' ? 'down' : 'muted')) + '">'
+        + (d.emaTrend ? esc(d.emaTrend.replace('NO_CONFIRM', 'NO CONF.')) : '—')
+        + (d.emaSeparationP != null
+          ? ' <small class="muted">' + (d.emaSeparationP >= 0 ? '+' : '') + lvl(d.emaSeparationP) + '</small>'
+          : '')
+        + '</td>'
       + '<td class="' + t.cls + '">' + t.label + '</td>'
       + '<td>' + lvl(d.openP) + '</td>'
       + '<td>' + lvl(d.highP) + '</td>'

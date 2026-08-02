@@ -71,12 +71,26 @@ const NUMERIC = [
   'premiumSafetyExitPoints', 'reentryWaitCandles',
   'maxOpenTrades', 'maxTradesPerDay', 'maxConsecutiveLosses',
   'lots', 'scanRange', 'indexMinTicks', 'optionMinTicks',
+  // newdoc/ema.md `[MUST-CONFIRM #18]`.
+  'emaFlatPoints', 'emaChopLookback', 'emaChopFlips', 'emaCrossCooldownCandles',
+  // The index-feed sanity check — src/ose/spotGuard.js.
+  'spotCheckMaxDivergencePoints', 'spotCheckMinPairs',
+  // The synthetic index — src/ose/syntheticIndex.js.
+  'syntheticIndexStrikes',
 ];
 
 // An unchecked checkbox is simply absent from a form body, so the page posts
 // every one of these explicitly — otherwise they could be turned on but never
 // off.
-const BOOLEAN = ['trailingStopEnabled', 'tradeOnExpiryDay', 'stopGuardEnabled'];
+const BOOLEAN = [
+  'trailingStopEnabled', 'tradeOnExpiryDay', 'stopGuardEnabled',
+  // Both ship ON and both are MANDATORY in ema.md, which is exactly why they
+  // have to be in this list: a checkbox that can be ticked and never unticked
+  // is not a control, and one that silently unticks itself on an unrelated save
+  // would turn the strategy's first trend filter off without anyone deciding to.
+  'emaFilterEnabled', 'emaExitOnCrossover',
+  'spotCheckEnabled',
+];
 
 function coerce(patch) {
   const out = { ...patch };
@@ -214,20 +228,32 @@ for (const [path, intent, note] of [
 
 api.get('/status', wrap(async (req, res) => {
   const tradeDate = time.tradeDate();
-  const [stats, stateFlag, intent, account, trade, tally, settingsRow, latest, watchFlag] =
+
+  // Read the state flag FIRST, on its own, because the tally depends on it.
+  //
+  // The tally is scoped to the engine's CURRENT RUN — see the note on
+  // `oseDecisions.outcomeTally`. `up` is the run's start, published by the
+  // engine; when it is absent (engine down, or a build from before this
+  // existed) the tally falls back to the whole day rather than showing nothing.
+  //
+  // Deliberately not a module-level variable feeding the batch below: two
+  // concurrent requests would then scope each other's tally.
+  const stateFlag = await repo.flags.get(STATE_FLAG, null);
+  const engine = readState(stateFlag);
+  const runStartedMs = Number.isFinite(Number(engine?.up)) ? Number(engine.up) : null;
+
+  const [stats, intent, account, trade, tally, settingsRow, latest, watchFlag] =
     await Promise.all([
     repo.oseStats.ensure(tradeDate),
-    repo.flags.get(STATE_FLAG, null),
     repo.flags.get(INTENT_FLAG, 'RUN'),
     repo.broker.get('primary'),
     repo.oseTrades.live(),
-    repo.oseDecisions.outcomeTally(tradeDate),
+    repo.oseDecisions.outcomeTally(tradeDate, { sinceMs: runStartedMs }),
     repo.settings.get(settingsService.PROFILE),
     repo.oseDecisions.recent(1),
     repo.flags.get(WATCH_FLAG, null),
   ]);
 
-  const engine = readState(stateFlag);
   // How stale the engine's own heartbeat is. Without this the page cannot tell
   // "the engine says nothing is tradable" from "the engine is not running".
   const ageMs = engine?.atMs ? Date.now() - Number(engine.atMs) : null;
@@ -294,6 +320,11 @@ api.get('/status', wrap(async (req, res) => {
       return {
         ageMs: w.at ? Date.now() - w.at : null,
         spotP: w.spot ?? null,
+        // Present ONLY while the index feed disagrees with the chain. The page
+        // leads with this one when it is set, because it is the level the
+        // options are actually priced against — see src/ose/spotGuard.js.
+        impliedSpotP: w.is ?? null,
+        feedStale: w.is != null,
         atmStrike: w.spot ? Math.round((w.spot / 100) / 50) * 50 : null,
         ce: side(w.ce),
         pe: side(w.pe),
@@ -301,8 +332,18 @@ api.get('/status', wrap(async (req, res) => {
       };
     })(),
 
-    // §11.5's payoff: the tally of WHY the engine did or did not act today.
+    // §11.5's payoff: the tally of WHY the engine did or did not act.
+    //
+    // Scoped to this engine RUN and to LIVE rows only. The replay and the self
+    // test drive the same engine and write real decision rows, and counting
+    // those alongside a live session made this panel report 18 entries on a day
+    // the engine had taken none.
     outcomes: tally.map(r => ({ outcome: r.outcome, n: Number(r.n) })),
+    outcomesScope: {
+      sinceMs: runStartedMs,
+      // What the page should say above the numbers.
+      label: runStartedMs ? 'since the engine started' : 'today',
+    },
 
     // The four numbers §11 actually decides on, from the most recent sealed
     // candle. Without these the page can say the engine is scanning but not
@@ -320,6 +361,11 @@ api.get('/status', wrap(async (req, res) => {
       ...midsFor(latest[0]),
       trend: latest[0].trend,
       trendVia: latest[0].trend_via,
+      // newdoc/ema.md — the first filter every entry has to clear. Surfaced on
+      // the status tile because "the engine is scanning" and "the engine is
+      // scanning but the EMAs are 0.1 points apart" call for very different
+      // reactions from an operator watching an idle session.
+      ...emaFor(latest[0]),
       tickCount: latest[0].tick_count,
       lowConfidence: Boolean(latest[0].low_confidence),
       synthetic: Boolean(latest[0].synthetic),
@@ -356,6 +402,9 @@ api.get('/decisions', wrap(async (req, res) => {
       // engine used, so the log can never disagree with the decision, and the
       // midpoints stay readable next to the bar they come from.
       ...midsFor(r),
+      // newdoc/ema.md. Null on rows written before the filter existed, and that
+      // null is left as null — a zero EMA is a price, not a missing reading.
+      ...emaFor(r),
       synthetic: Boolean(r.synthetic),
       lowConfidence: Boolean(r.low_confidence),
       tickCount: r.tick_count,
@@ -439,6 +488,31 @@ function midsFor(row) {
   } catch (_) {
     return stored;
   }
+}
+
+// newdoc/ema.md, off a stored decision row.
+//
+// The SEPARATION is computed here rather than being another column, because it
+// is exactly `ema9 - ema20` and a stored copy could disagree with the pair it
+// was derived from after a schema change. It is also the number an operator
+// actually reads: "0.08 apart" says why the filter refused, where two averages
+// quoted to four decimals do not.
+//
+// mysql2 returns DECIMAL as a STRING to preserve precision, so both come through
+// `Number()` before any arithmetic. Without that, `ema9 - ema20` is still a
+// number but `ema9 + ema20` would be string concatenation — the kind of bug that
+// surfaces only once somebody adds a midpoint.
+function emaFor(row) {
+  const ema9P = row.ema9_p == null ? null : Number(row.ema9_p);
+  const ema20P = row.ema20_p == null ? null : Number(row.ema20_p);
+  return {
+    ema9P,
+    ema20P,
+    emaSeparationP: (ema9P == null || ema20P == null) ? null : ema9P - ema20P,
+    emaTrend: row.ema_trend ?? null,
+    emaVia: row.ema_via ?? null,
+    indexSource: row.index_source ?? null,
+  };
 }
 
 function safeJson(value) {

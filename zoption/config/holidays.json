@@ -2,25 +2,90 @@
   "_note": [
     "newdoc/update.md §17.7 — the exchange trading calendar.",
     "",
-    "THIS FILE SHIPS EMPTY ON PURPOSE. A holiday list is a safety device, and a",
-    "wrong one is worse than an absent one: a date this file gets wrong is a day",
-    "the engine either sits out a live session or, far worse, tries to trade a",
-    "closed exchange and spends the morning interpreting silence as a quiet tape.",
+    "A holiday list is a safety device, and a wrong one is worse than an absent",
+    "one: a date this file gets wrong is a day the engine either sits out a live",
+    "session or, far worse, tries to trade a closed exchange and spends the",
+    "morning interpreting silence as a quiet tape.",
     "",
-    "So it is not guessed. Fill `dates` from the NSE trading-holiday circular for",
-    "the year before the first production session.",
+    "So these dates were NOT written from memory. See `_provenance` below.",
     "",
     "What the engine does with it (src/ose/risk.js — validateCalendar):",
     "  * empty or unreadable  -> refuses to start in production, warns elsewhere",
     "  * no date on or after today in the current year -> treated as STALE, same",
     "    refusal. A calendar that ran out in December is a calendar nobody",
-    "    maintained.",
+    "    maintained. THIS FILE GOES STALE ON 2026-12-26 — replace it before then.",
     "  * weekends are detected from the IST day of week and are NOT listed here.",
     "",
     "Format: either a plain 'YYYY-MM-DD' string or { date, name }. Both are",
-    "accepted so the list can carry the holiday's name without a second file."
+    "accepted so the list can carry the holiday's name without a second file.",
+    "",
+    "The key is `holidays`. `dates` is also accepted (src/ose/risk.js —",
+    "readCalendar), because an earlier revision of this note asked for `dates`",
+    "while every reader took `holidays`, and a calendar filled in as instructed",
+    "would have read as empty."
   ],
+
+  "_provenance": [
+    "Compiled 2026-08-02. Two steps, because the year-to-date half of a calendar",
+    "is a FACT that can be checked and the forward half is not.",
+    "",
+    "1. OBSERVED. NIFTY daily bars for 2026-01-01..2026-08-02 were pulled from",
+    "   Yahoo (^NSEI) and every weekday with no bar was taken as a closed day.",
+    "   That yielded exactly ten dates — an empirical record of when the",
+    "   exchange was actually shut, derived without consulting any holiday list.",
+    "",
+    "2. SOURCED. The full-year list was then taken from two independent",
+    "   published calendars (see _sources) and checked against those ten:",
+    "",
+    "     observed but missing from the list  0   <- the dangerous direction",
+    "     listed but not observed             0",
+    "     weekend entries                     0",
+    "",
+    "   Exact agreement on the verifiable half. That is what the forward dates",
+    "   rest on; they are not independently verifiable until they arrive.",
+    "",
+    "NOT ASSERTED: the holiday NAMES below come from the same sources and were",
+    "not separately checked. Nothing in the engine reads them — only `date`.",
+    "",
+    "Independence Day (2026-08-15) and three other notified holidays fall on",
+    "weekends in 2026 and are deliberately absent: risk.isWeekend covers them."
+  ],
+
+  "_sources": [
+    "https://www.kotakneo.com/share-market-holidays/nse-holidays/",
+    "https://cleartax.in/s/nse-holidays-2026"
+  ],
+
+  "_disputed": [
+    "2026-11-24 (Guru Nanak Jayanti) appears in the Kotak Neo list and NOT in",
+    "the ClearTax one. It is INCLUDED here deliberately.",
+    "",
+    "The two errors are not symmetric. Listing a day that turns out to trade",
+    "costs one sat-out session. Omitting a day that turns out to be shut means",
+    "the engine opens a naked short into an exchange that cannot fill or close",
+    "it. Confirm against the NSE circular before November and remove it if the",
+    "exchange is open — but until then, closed is the safe assumption."
+  ],
+
   "exchange": "NSE",
   "segment": "F&O",
-  "dates": []
+
+  "holidays": [
+    { "date": "2026-01-15", "name": "Municipal Elections (Maharashtra)" },
+    { "date": "2026-01-26", "name": "Republic Day" },
+    { "date": "2026-03-03", "name": "Holi" },
+    { "date": "2026-03-26", "name": "Shri Ram Navami" },
+    { "date": "2026-03-31", "name": "Shri Mahavir Jayanti" },
+    { "date": "2026-04-03", "name": "Good Friday" },
+    { "date": "2026-04-14", "name": "Dr. Baba Saheb Ambedkar Jayanti" },
+    { "date": "2026-05-01", "name": "Maharashtra Day" },
+    { "date": "2026-05-28", "name": "Bakri Id" },
+    { "date": "2026-06-26", "name": "Muharram" },
+    { "date": "2026-09-14", "name": "Ganesh Chaturthi" },
+    { "date": "2026-10-02", "name": "Mahatma Gandhi Jayanti" },
+    { "date": "2026-10-20", "name": "Dussehra" },
+    { "date": "2026-11-10", "name": "Diwali Balipratipada" },
+    { "date": "2026-11-24", "name": "Guru Nanak Jayanti (disputed — see _disputed)" },
+    { "date": "2026-12-25", "name": "Christmas" }
+  ]
 }

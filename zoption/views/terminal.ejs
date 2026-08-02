@@ -74,26 +74,60 @@
     <aside class="pane pane-summary">
       <div class="pane-h"><h2>Market summary</h2></div>
 
+      <!-- Each tile declares the capability it needs via `data-need`, and the
+           renderer HIDES the ones this account cannot compute rather than
+           printing an em-dash. A panel that is mostly dashes is one an operator
+           stops reading — and on a Kotak retail entitlement (ltp only) that was
+           seven of the ten tiles below.
+
+           The tiles with no `data-need` are always computable: they come from
+           the premiums and the spot, which are the two things always present. -->
       <div class="tiles">
         <div class="tile"><span class="k">Spot</span><b id="sm-spot" class="v">—</b></div>
         <div class="tile"><span class="k">ATM</span><b id="sm-atm" class="v">—</b></div>
-        <div class="tile"><span class="k">PCR</span><b id="sm-pcr" class="v">—</b></div>
-        <div class="tile"><span class="k">Max pain</span><b id="sm-maxpain" class="v">—</b></div>
-        <div class="tile"><span class="k">India VIX</span><b id="sm-vix" class="v">—</b></div>
+
+        <!-- The market's own price for movement to expiry: buying both ATM legs
+             breaks even only if the index travels further than they cost. -->
+        <div class="tile" data-need="straddle">
+          <span class="k">ATM straddle</span><b id="sm-straddle" class="v">—</b>
+          <span class="sub" id="sm-straddle-legs"></span>
+        </div>
+        <div class="tile" data-need="expectedMove">
+          <span class="k">Expected move</span><b id="sm-move" class="v">—</b>
+          <span class="sub" id="sm-move-range"></span>
+        </div>
+        <div class="tile" data-need="iv"><span class="k">ATM IV</span><b id="sm-iv" class="v">—</b></div>
+        <!-- Put IV over call IV, two strikes either side. Positive is the usual
+             state; a flat or inverted skew is a real signal that costs nothing
+             to compute on this entitlement. -->
+        <div class="tile" data-need="skew"><span class="k">IV skew</span><b id="sm-skew" class="v">—</b></div>
+
+        <div class="tile"><span class="k">Expiry</span><b id="sm-expiry" class="v">—</b>
+          <span class="sub" id="sm-dte"></span></div>
         <div class="tile"><span class="k">Lot size</span><b id="sm-lot" class="v">—</b></div>
-        <div class="tile"><span class="k">Total call OI</span><b id="sm-calloi" class="v">—</b></div>
-        <div class="tile"><span class="k">Total put OI</span><b id="sm-putoi" class="v">—</b></div>
-        <div class="tile"><span class="k">Net OI</span><b id="sm-netoi" class="v">—</b></div>
-        <div class="tile"><span class="k">Expiry</span><b id="sm-expiry" class="v">—</b></div>
+
+        <!-- Everything below needs open interest, volume or a VIX feed. Kept in
+             the DOM so a richer entitlement lights them up with no code change,
+             and hidden until then. -->
+        <div class="tile" data-need="pcr"><span class="k">PCR</span><b id="sm-pcr" class="v">—</b></div>
+        <div class="tile" data-need="maxPain"><span class="k">Max pain</span><b id="sm-maxpain" class="v">—</b></div>
+        <div class="tile" data-need="vix"><span class="k">India VIX</span><b id="sm-vix" class="v">—</b></div>
+        <div class="tile" data-need="oi"><span class="k">Total call OI</span><b id="sm-calloi" class="v">—</b></div>
+        <div class="tile" data-need="oi"><span class="k">Total put OI</span><b id="sm-putoi" class="v">—</b></div>
+        <div class="tile" data-need="oi"><span class="k">Net OI</span><b id="sm-netoi" class="v">—</b></div>
       </div>
 
       <h3>Index</h3>
-      <dl class="kv2">
-        <dt>Open</dt><dd id="ix-open">—</dd>
-        <dt>High</dt><dd id="ix-high">—</dd>
-        <dt>Low</dt><dd id="ix-low">—</dd>
-        <dt>Previous close</dt><dd id="ix-prev">—</dd>
-        <dt>Day range</dt><dd id="ix-range">—</dd>
+      <!-- The OHLC rows need the `ohlc` quote filter, which this account is not
+           served — they are hidden by the same rule as the tiles above rather
+           than rendering six em-dashes. Bar activity and SuperTrend are computed
+           from the recorded tick series and always work. -->
+      <dl class="kv2" id="ix-stats">
+        <dt data-need="ohlc">Open</dt><dd data-need="ohlc" id="ix-open">—</dd>
+        <dt data-need="ohlc">High</dt><dd data-need="ohlc" id="ix-high">—</dd>
+        <dt data-need="ohlc">Low</dt><dd data-need="ohlc" id="ix-low">—</dd>
+        <dt data-need="ohlc">Previous close</dt><dd data-need="ohlc" id="ix-prev">—</dd>
+        <dt data-need="ohlc">Day range</dt><dd data-need="ohlc" id="ix-range">—</dd>
         <dt>VWAP</dt><dd id="ix-vwap">—</dd>
         <dt>Bar activity</dt><dd id="ix-ticks">—</dd>
         <dt>SuperTrend</dt><dd id="ix-trend">—</dd>

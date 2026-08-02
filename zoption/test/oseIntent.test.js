@@ -68,8 +68,8 @@ function withFlag(value, fn) {
 function engine() {
   const e = new OseEngine({
     ticker: { on() {}, subscribe() {}, unsubscribe() {} },
-    indexCandles: { on() {}, start() {}, stop() {}, track() {}, untrack() {} },
-    optionCandles: { on() {}, start() {}, stop() {}, track() {}, untrack() {} },
+    indexCandles: { on() {}, start() {}, stop() {}, track() {}, untrack() {}, addTick() {} },
+    optionCandles: { on() {}, start() {}, stop() {}, track() {}, untrack() {}, addTick() {} },
     quoteSource: { snapshot: async () => new Map() },
     router: {},
     reconciler: { runOnce: async () => {} },
@@ -78,7 +78,7 @@ function engine() {
   e.cfg = settingsService.derive(settingsService.withDefaults({ mode: 'PAPER' }));
   e.machine.current = STATES.SCANNING;
   e.indexToken = 'Nifty 50';
-  e.indexSeries = h.series(3, 100);
+  e.indexSeries = h.warmSeries(100);
   // The engine must never reach a chain fetch in these tests; if it does, the
   // intent was not consulted and that is the failure.
   e.chain.get = () => { throw new Error('the intent was not consulted before the chain'); };
@@ -230,6 +230,70 @@ test('the published state fits system_flags.value and survives a round trip', as
   });
 });
 
+test('the watch record still fits VARCHAR(255) with the implied spot on it', async () => {
+  // Same trap as `ose_state`: MySQL truncates silently, the JSON loses its
+  // closing brace, the page's parse returns null, and the watch box goes blank
+  // forever. The implied-spot field was added to a record that was already
+  // close to the ceiling, so its size is asserted rather than assumed.
+  await withFlag('RUN', async (written) => {
+    const e = engine();
+    const spotP = 2511755;
+    e.indexSeries = h.warmSeries(100).map(b => ({ ...b, closeP: spotP }));
+
+    // A full chain, and one that disagrees with the feed — the worst case for
+    // length, because that is when the extra field is present.
+    const quotes = [];
+    for (let i = -20; i <= 20; i += 1) {
+      const strike = 24400 + i * 50;
+      quotes.push(h.quote({ strike, optionType: 'CE', token: `${strike}CE`,
+        symbol: `NIFTY2680${strike}CE`, ltpP: 5000 + Math.max(0, 2438360 - strike * 100) }));
+      quotes.push(h.quote({ strike, optionType: 'PE', token: `${strike}PE`,
+        symbol: `NIFTY2680${strike}PE`, ltpP: 5000 - Math.min(0, 2438360 - strike * 100) }));
+    }
+    e.chain.snapshot = Object.freeze({ ts: Date.now(), quotes, corrupt: false });
+    e.chain.get = () => ({ ok: true, snapshot: e.chain.snapshot });
+
+    await e._publishWatch();
+
+    const row = written.published.find(([name]) => name === 'ose_watch');
+    assert.ok(row, 'the watch record must be published');
+    const [, value] = row;
+    assert.ok(value.length <= 255, `published ${value.length} chars into a VARCHAR(255)`);
+
+    const parsed = JSON.parse(value);            // throws if it was truncated
+    assert.ok(Number.isFinite(parsed.is),
+      'a feed this far from the chain must carry the implied spot');
+    assert.ok(Math.abs(parsed.is - 2438360) < 5000,
+      `the chain prices the index near 24383.60, got ${(parsed.is / 100).toFixed(2)}`);
+  });
+});
+
+test('the implied spot is omitted when the feed and the chain agree', async () => {
+  // It is a disagreement marker, not a second price. Publishing it always would
+  // spend bytes on the record's tight budget to say nothing.
+  await withFlag('RUN', async (written) => {
+    const e = engine();
+    const spotP = 2438360;
+    e.indexSeries = h.warmSeries(100).map(b => ({ ...b, closeP: spotP }));
+
+    const quotes = [];
+    for (let i = -3; i <= 3; i += 1) {
+      const strike = 24400 + i * 50;
+      const parity = spotP - strike * 100;
+      quotes.push(h.quote({ strike, optionType: 'CE', token: `${strike}CE`,
+        ltpP: 5000 + Math.max(0, parity) }));
+      quotes.push(h.quote({ strike, optionType: 'PE', token: `${strike}PE`,
+        ltpP: 5000 + Math.max(0, parity) - parity }));
+    }
+    e.chain.snapshot = Object.freeze({ ts: Date.now(), quotes, corrupt: false });
+    e.chain.get = () => ({ ok: true, snapshot: e.chain.snapshot });
+
+    await e._publishWatch();
+    const [, value] = written.published.find(([name]) => name === 'ose_watch');
+    assert.equal(JSON.parse(value).is, undefined);
+  });
+});
+
 test('a chain fault cannot take the safety timer down with it', async () => {
   // The safety timer is what squares off a position when the candle feed has
   // stopped (§16.2 priority 0). It also refreshes the display, and a display
@@ -238,7 +302,7 @@ test('a chain fault cannot take the safety timer down with it', async () => {
   await withFlag('RUN', async () => {
     await h.withOpenSession(async () => {
       const e = engine();
-      e.indexSeries = h.series(3, 100);
+      e.indexSeries = h.warmSeries(100);
       e.chain.get = () => { throw new Error('the chain exploded'); };
 
       await e._onSafetyTimer();          // must not reject

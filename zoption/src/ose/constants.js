@@ -34,6 +34,42 @@ const TREND_LOOKBACK = 3;             // completed index candles — §10.1
 const CANDLE_MS = 5000;               // §5.2
 const MAX_CANDLE_HISTORY = 720;       // one hour of 5s bars — §7.6
 
+/* ------------------------------- newdoc/ema.md, the EMA confirmation filter -- */
+
+// The two periods. NOT tunable, and this is the one place in the EMA engine
+// where that is not a judgement call: newdoc/ema.md names EMA 9 and EMA 20 in
+// its title, its formulas, its rules and its summary table. A different pair is
+// a different filter and belongs in a revision of that document.
+const EMA_FAST = 9;
+const EMA_SLOW = 20;
+
+// The defaults for everything the specification left as a word rather than a
+// number. Each has a matching operator setting (see ./settings.js) because the
+// document gives no value for any of them and a number nobody chose is a number
+// nobody can defend — but the shipped default lives here so a script, a test or
+// a backtest with no configuration still runs the shipped behaviour.
+//
+// `[MUST-CONFIRM #18]` covers all four.
+
+// "EMA9 == EMA20", which the summary table writes "EMA9 ~= EMA20". Two floating
+// averages of different periods are never bit-identical, so the equality read
+// literally would fire never. This is the band inside which they are not
+// distinguishable: 0.25 index points, in paise.
+const EMA_FLAT_P = 25;
+
+// "Price is moving repeatedly above and below EMA9" — how many candles are
+// looked at, and how many side-changes inside them count as repeatedly. Three
+// crossings in six candles means the close changed sides on half the bar
+// transitions in the window, which is chop by any reading.
+const EMA_CHOP_LOOKBACK = 6;
+const EMA_CHOP_FLIPS = 3;
+
+// "EMA crossover has just occurred." The crossover candle itself and the one
+// after it are refused; an entry is possible from the second candle on. The
+// separation at a crossover is by definition near zero, and the candle that
+// decides whether it was a turn or a wobble is the one that has not happened yet.
+const EMA_CROSS_COOLDOWN = 2;
+
 /* ---------------------------------------------------- §7, market data timing -- */
 
 // §7.3 — a bucket seals at the earlier of the first tick past it or this long
@@ -369,6 +405,40 @@ const MUST_CONFIRM = Object.freeze([
       + 'will fill more slowly in reality than in simulation. Paper results are an OPTIMISTIC '
       + 'BOUND, which is why §25.8 accepts on "zero halts from defects" rather than on P&L.',
   },
+
+  /* ------------------------------------------------------------------------ */
+  /* Raised by newdoc/ema.md — the EMA Trend Confirmation Engine.              */
+  /*                                                                          */
+  /* That document specifies the filter completely in WORDS and gives a value */
+  /* for none of the three sideways rules. Each of those words had to become  */
+  /* a number before the filter could run, and a number nobody chose is a     */
+  /* number nobody can defend after a bad session.                            */
+  /* ------------------------------------------------------------------------ */
+  {
+    id: 18,
+    section: 'ema.md §Sideways Market',
+    item: 'The three sideways thresholds the EMA document leaves as prose',
+    proposed: 'flat band 0.25 index points · chop 3 flips in 6 candles · crossover cooldown 2 candles',
+    implemented: 'EMA_FLAT_P / EMA_CHOP_LOOKBACK / EMA_CHOP_FLIPS / EMA_CROSS_COOLDOWN in this '
+      + 'file, tunable as emaFlatPoints / emaChopLookback / emaChopFlips / emaCrossCooldownCandles',
+    note: 'The flat band is the consequential one. "EMA9 == EMA20" cannot be read literally on '
+      + 'floating averages — it would fire never — so the rule only exists at all because a band '
+      + 'was chosen. Set it too wide and the engine refuses every quiet trend; too narrow and the '
+      + 'sideways rule is decoration. Watch the EMA_SIDEWAYS tally on /ose for a session before '
+      + 'signing this off: it is the direct measure of how much the filter is costing.',
+  },
+  {
+    id: 19,
+    section: 'ema.md §Position Exit Rule',
+    item: 'The EMA crossover exit reads the STATE, not the crossover edge',
+    proposed: 'State — exit whenever EMA9 sits on the wrong side of EMA20 for the held side',
+    implemented: 'src/ose/ema.js — isBreak(), fired by src/ose/exits.js as EXIT_EMA_CROSS',
+    note: 'A crossover is visible on exactly ONE candle, and §4.2 drops a candle that seals while '
+      + 'the previous cycle is still running — so an edge-triggered exit can be missed outright '
+      + 'while a naked short is open. Reading the relationship cannot be missed and cannot fire '
+      + 'early, because an entry required the averages separated the other way. It does mean the '
+      + 'exit reason says "crossed" only when the crossover happened on the candle that fired it.',
+  },
 ]);
 
 const MUST_CONFIRM_IDS = Object.freeze(MUST_CONFIRM.map(m => m.id));
@@ -376,6 +446,7 @@ const MUST_CONFIRM_IDS = Object.freeze(MUST_CONFIRM.map(m => m.id));
 module.exports = Object.freeze({
   TICK, POINT,
   TREND_LOOKBACK, CANDLE_MS, MAX_CANDLE_HISTORY,
+  EMA_FAST, EMA_SLOW, EMA_FLAT_P, EMA_CHOP_LOOKBACK, EMA_CHOP_FLIPS, EMA_CROSS_COOLDOWN,
   SEAL_GRACE_MS, MAX_SYNTHETIC_RUN,
   CHAIN_REFRESH_MS, CHAIN_TIMEOUT_MS, CHAIN_MAX_AGE_MS, CHAIN_CORRUPT_PCT,
   STRIKE_MULTIPLE, CHAIN_STALE_HALT,

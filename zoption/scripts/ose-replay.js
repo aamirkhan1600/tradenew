@@ -26,6 +26,21 @@
 //
 // Deterministic: the same seed replays exactly the same session. It cleans up
 // after itself, including the day's risk counters.
+//
+// ---------------------------------------------------------------------------
+// The decision rows it writes are NOT a record of the replay
+// ---------------------------------------------------------------------------
+//
+// The bars are stamped from a fixed 10:00 IST, so a second run on the same day
+// produces the same `(trade_date, candle_ts)` keys as the first. `ose_decisions`
+// is keyed on exactly that pair with `ON DUPLICATE KEY UPDATE id = id`, so those
+// rows are SILENTLY DROPPED — and on a live day they collide with the real
+// engine's rows instead.
+//
+// Everything this script reports comes from its own in-memory tally and from the
+// trades it made, so its OUTPUT is unaffected. But do not read `ose_decisions`
+// afterwards expecting to find this run in it: you will find the first run of
+// the day, or the engine's. That mistake has already been made once.
 
 const repo = require('../src/repositories');
 const db = require('../src/core/db');
@@ -132,6 +147,10 @@ async function main() {
     router, reconciler, broker, session: null,
   });
   engine.cfg = cfg;
+  // Mark every decision row this run writes, so the /ose panel can tell a
+  // simulated session from a real one. Without it, eighteen replayed entries
+  // read as eighteen trades the engine took today.
+  engine.decisionSource = 'REPLAY';
   engine.machine.current = STATES.SCANNING;
   engine.indexToken = 'SIM-NIFTY';
   engine._maintainedDate = time.tradeDate();

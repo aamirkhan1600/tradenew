@@ -570,6 +570,46 @@ CREATE TABLE IF NOT EXISTS ose_decisions (
   trend_via       VARCHAR(24) NULL,
   bullish_mid_p   INT NULL,
   bearish_mid_p   INT NULL,
+  -- newdoc/ema.md — the EMA Trend Confirmation Engine's state on this candle.
+  --
+  -- DECIMAL rather than INT: an EMA of integer paise is a fractional paise, and
+  -- the quantity every rule in that document compares is the DIFFERENCE between
+  -- these two. Rounding them to whole paise before storing would make a row
+  -- whose stored values say "level" while the engine acted on a crossover — the
+  -- decision log would then disagree with the decision, which is the one thing
+  -- it may never do.
+  --
+  -- Populated on EVERY row, including the ones the EMA filter did not decide.
+  -- A column only written on refusals cannot answer "what were the averages
+  -- doing when it DID trade", which is the more expensive question.
+  ema9_p          DECIMAL(14,4) NULL,
+  ema20_p         DECIMAL(14,4) NULL,
+  -- BULLISH / BEARISH / SIDEWAYS / NO_CONFIRM / WARMING_UP. Not an ENUM: the
+  -- sideways rules are `[MUST-CONFIRM #18]` and a register still under review
+  -- should not need an ALTER TABLE to gain a state.
+  ema_trend       VARCHAR(12) NULL,
+  ema_via         VARCHAR(24) NULL,
+  -- Where the index level behind this decision came from — 'FEED' (the quoted
+  -- index) or 'CHAIN' (put-call parity over subscribed option legs). See
+  -- src/ose/syntheticIndex.js.
+  --
+  -- On every row rather than only on the derived ones: the question asked after
+  -- a surprising trade is "what was the index doing, and did we believe it",
+  -- and a column that is null for the normal case cannot distinguish "quoted"
+  -- from "written before this column existed".
+  index_source    VARCHAR(8) NULL,
+  -- Who wrote this row: 'LIVE' (the engine), 'REPLAY' (scripts/ose-replay.js) or
+  -- 'SELFTEST' (scripts/ose-selftest.js).
+  --
+  -- The replay and the self test drive the REAL engine, so they write real
+  -- decision rows into this table — and the /ose panel counted them alongside
+  -- the live ones. On 2026-08-02 that made the page report ENTRY_TAKEN 18 on a
+  -- day the engine had taken no trades at all: eighteen simulated entries,
+  -- written in a one-second burst, indistinguishable from a morning's trading.
+  --
+  -- A simulation that cannot be told apart from the record of what actually
+  -- happened is worse than no simulation.
+  source          VARCHAR(8) NOT NULL DEFAULT 'LIVE',
   -- ENTRY_TAKEN, or the §11.5 rejection reason. Never null.
   outcome         VARCHAR(48) NOT NULL,
   detail          VARCHAR(255) NULL,

@@ -19,6 +19,7 @@ const time = require('../src/core/time');
 const money = require('../src/core/money');
 const risk = require('../src/ose/risk');
 const strikes = require('../src/ose/strikes');
+const spotGuard = require('../src/ose/spotGuard');
 const chainRules = require('../src/ose/chain');
 const settingsService = require('../src/ose/settings');
 const C = require('../src/ose/constants');
@@ -79,7 +80,7 @@ async function main() {
     try { return JSON.parse(fs.readFileSync(config.ose.holidayFile, 'utf8')); }
     catch (_) { return null; }
   })();
-  const holidays = Array.isArray(holidayRaw) ? holidayRaw : (holidayRaw?.holidays || []);
+  const holidays = risk.readCalendar(holidayRaw);
   if (!holidays.length) {
     warn('exchange holiday calendar loaded',
       `${config.ose.holidayFile} is EMPTY — weekends are detected, holidays are not. `
@@ -143,6 +144,25 @@ async function main() {
       + 'A spike that crosses the stop and retraces between two polls will not fire it (§16.4).');
   } else pass('sampled-stop guard', 'ON — the live sample is re-checked every second');
 
+  // newdoc/ema.md. Reported here because the filter changes when the engine can
+  // trade at all — an operator who starts the process at 09:19 and sees nothing
+  // happen at 09:20 is looking at the warm-up, not at a fault.
+  if (!cfg._ema.enabled) {
+    warn('EMA trend filter', 'OFF — ema.md makes EMA9/EMA20 confirmation MANDATORY before any '
+      + 'entry. With it off, nothing stops the engine selling into a sideways tape.');
+  } else {
+    pass('EMA trend filter', `ON — EMA${C.EMA_FAST}/EMA${C.EMA_SLOW}, flat band `
+      + `${(cfg._ema.emaFlatP / 100).toFixed(2)} pts, cooldown ${cfg._ema.emaCrossCooldown} `
+      + `candles, chop ${cfg._ema.emaChopFlips}/${cfg._ema.emaChopLookback}. First entry is `
+      + `possible ${cfg._ema.warmupCandles * Number(cfg.timeframeSeconds)}s after the feed starts.`);
+  }
+
+  if (!cfg._rules.emaExitOnCrossover) {
+    warn('EMA crossover exit', 'OFF — ema.md\'s §Position Exit Rule is not enforced. A position '
+      + 'whose EMA structure has inverted waits for the trend break, the validity filter or the '
+      + 'stop instead.');
+  } else pass('EMA crossover exit', 'ON — an inverted EMA structure closes the position');
+
   const note = settingsService.breakevenNote(cfg, 75);
   const rate = note.requiredWinRate == null ? null : Math.round(note.requiredWinRate * 100);
   if (rate == null) fail('first rung clears charges', 'a winning trade still books a loss at this size');
@@ -195,14 +215,36 @@ async function main() {
   } else {
     const qs = new QuoteSource({ session, batchSize: config.neo.quoteBatch, label: 'preflight' });
     const chain = new ChainSnapshot({ quoteSource: qs });
-    const spotRow = await db.queryOne(
-      `SELECT close_p FROM ose_decisions WHERE trade_date = ? ORDER BY id DESC LIMIT 1`)
-      .catch(() => null);
-    const spotP = Number(spotRow?.close_p) || await lastIndexClose();
+    // The column is `nifty_close_p`, and the placeholder needs a value.
+    //
+    // This query used to select `close_p` and bind nothing, so it threw
+    // `Unknown column` on EVERY run — and the `.catch(() => null)` swallowed it
+    // whole. Preflight then silently fell through to whatever the `candles`
+    // table happened to hold, which is a different number from the one the
+    // engine is deciding on. The check that exists to be run before a session
+    // was reporting on data the engine does not use, and it reported "Ready"
+    // through a 734-point index error on 2026-08-02.
+    //
+    // The catch is gone with it. A failing diagnostic must fail visibly.
+    let spotRow = null;
+    try {
+      spotRow = await db.queryOne(
+        `SELECT nifty_close_p FROM ose_decisions WHERE trade_date = ?
+           ORDER BY id DESC LIMIT 1`, [time.tradeDate()]);
+    } catch (err) {
+      fail('engine spot readable', `the decision log could not be read — ${err.message}`);
+    }
+    const engineSpotP = Number(spotRow?.nifty_close_p) || 0;
+    const spotP = engineSpotP || await lastIndexClose();
 
     if (!spotP) {
       warn('spot price known', 'no sealed index candle yet — start the engine first');
-    } else {
+    } else if (!engineSpotP) {
+      warn('spot price known', 'no decision row for today — this is the last stored 5s candle, '
+        + 'NOT what a running engine is deciding on. Start the engine and re-run.');
+    }
+
+    if (spotP) {
       const t0 = Date.now();
       await chain.refresh({ spotP, cfg: cfg._gate });
       const took = Date.now() - t0;
@@ -220,6 +262,26 @@ async function main() {
         }
         pass('quote entitlement', `filter "${qs.filter}"`
           + (qs.filter === 'ltp' ? ' — LTP only, no OI/volume/depth' : ''));
+
+        // THE check that would have caught 2026-08-02, run here because this is
+        // the first moment both halves exist: a spot the engine is deciding on
+        // and a chain to cross-examine it with.
+        const sc = spotGuard.check(spotP, snap.quotes, cfg._spotCheck);
+        if (sc.verdict === spotGuard.VERDICT.DIVERGED) {
+          fail('index feed agrees with the chain',
+            `feed ${money.formatPrice(sc.feedSpotP)} vs ${sc.pairs} strikes pricing it at `
+            + `${money.formatPrice(sc.impliedSpotP)} — out by `
+            + `${money.formatPrice(Math.abs(sc.divergenceP))} points. DO NOT TRADE: the strike `
+            + 'selector will pick from the wrong part of the chain.');
+        } else if (sc.verdict === spotGuard.VERDICT.UNKNOWN) {
+          warn('index feed agrees with the chain', `not measurable — ${sc.reason}`);
+        } else if (sc.verdict === spotGuard.VERDICT.DISABLED) {
+          warn('index feed agrees with the chain', 'spotCheckEnabled is OFF');
+        } else {
+          pass('index feed agrees with the chain',
+            `${sc.pairs} strikes price the index at ${money.formatPrice(sc.impliedSpotP)}, `
+            + `within ${money.formatPrice(Math.abs(sc.divergenceP))} points of the feed`);
+        }
 
         const spot = spotP / 100;
         const atm = Math.round(spot / C.STRIKE_MULTIPLE) * C.STRIKE_MULTIPLE;
